@@ -1,0 +1,25 @@
+{
+    "num_instances": 2,
+    "annotations": [
+        {
+            "instance_id": 0,
+            "class": "left_cube",
+            "bbox": {
+                "x_min": 176.09,
+                "y_min": 202.12,
+                "x_max": 229.42,
+                "y_max": 261.57
+            }
+        },
+        {
+            "instance_id": 1,
+            "class": "right_cube",
+            "bbox": {
+                "x_min": 291.07,
+                "y_min": 285.48,
+                "x_max": 348.76,
+                "y_max": 346.68
+            }
+        }
+    ]
+}
