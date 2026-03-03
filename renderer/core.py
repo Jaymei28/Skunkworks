@@ -27,6 +27,7 @@ class Renderer3D:
             image_size=self.image_size, 
             blur_radius=0.0, 
             faces_per_pixel=1,
+            max_faces_per_bin=50000,  # Prevent coarse rasterizer overflow
         )
         
         self.rasterizer = MeshRasterizer(

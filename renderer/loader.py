@@ -6,10 +6,15 @@ import os
 
 class MeshLoader:
     """Helper class to load 3D models into PyTorch3D Meshes."""
+    _cache = {}  # (file_path, device) -> Mesh
     
     @staticmethod
     def load(file_path, device="cpu"):
         """Loads a mesh from a file path."""
+        cache_key = (file_path, str(device))
+        if cache_key in MeshLoader._cache:
+            return MeshLoader._cache[cache_key]
+
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"Mesh file not found: {file_path}")
             
@@ -30,4 +35,5 @@ class MeshLoader:
             verts_rgb = torch.ones_like(mesh.verts_padded()) # (N, V, 3)
             mesh.textures = TexturesVertex(verts_features=verts_rgb)
             
+        MeshLoader._cache[cache_key] = mesh
         return mesh

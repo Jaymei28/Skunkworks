@@ -1,6 +1,12 @@
-torch
-torchvision
-torchaudio
-pytorch3d
-matplotlib
+# Core UI
+PySide6
+
+# Data & Math
 numpy
+opencv-python
+matplotlib
+tqdm
+
+# AI & Rendering
+ultralytics
+# torch and pytorch3d are handled specially in the setup script for CUDA support
