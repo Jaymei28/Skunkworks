@@ -51,6 +51,13 @@ class SceneObject:
     rot_z: float = 0.0
     scale: float = 1.0
     visible: bool = True
+    # PBR material overrides
+    metallic:  float = 0.0
+    roughness: float = 0.8
+    floating:  bool  = False        # If true, reacts to ocean waves (buoyancy)
+    buoyancy_offset: float = 0.0    # Vertical offset for floating objects (waterline adjustment)
+    float_bob:  float = 1.0         # Bobbing intensity
+    float_tilt: float = 1.0         # Tilting intensity
 
     @property
     def display_name(self) -> str:
@@ -59,7 +66,11 @@ class SceneObject:
 
 @dataclass
 class WeatherConfig:
-    enabled: bool = True
+    enabled:      bool  = True
+    type:         str   = "clear"       # clear, cloudy, rain, stormy, snow, foggy
+    intensity:    float = 0.5           # 0..1 intensity of rain/snow/clouds
+    fog_density:  float = 0.05
+    
     weights: Dict[str, float] = field(default_factory=lambda: {
         "clear":    0.35,
         "rain":     0.20,
@@ -91,6 +102,9 @@ class PostProcessConfig:
     ao_min:            float =  0.0
     ao_max:            float =  0.35
 
+    fisheye_enabled:   bool  = False
+    fisheye_strength:  float = 0.5
+
     wb_enabled:        bool  = True
     wb_temp_min:       float =  3500.0
     wb_temp_max:       float =  8500.0
@@ -98,6 +112,64 @@ class PostProcessConfig:
     blur_enabled:      bool  = True
     blur_min:          float =  0.0
     blur_max:          float =  1.8
+
+
+@dataclass
+class OceanConfig:
+    enabled:      bool  = True
+    surface_type: str   = "Ocean"      # Ocean, River, Pool
+    level:        float = 0.0
+
+    # 🌊 Simulation (Unity HDRP-Style)
+    time_multiplier: float = 1.0
+    repetition_size: float = 500.0
+    
+    # Large Waves (Band 0 & 1)
+    wind_speed:      float = 30.0      # Maps to largeWindSpeed
+    wind_direction:  float = 0.0       # Maps to largeWindOrientation
+    choppiness:      float = 1.3
+    chaos:           float = 0.8       # Maps to largeChaos
+    wave_amplitude:  float = 1.0
+    
+    band0_multiplier: float = 1.0
+    band1_multiplier: float = 1.0
+    
+    # Currents
+    current_speed:       float = 0.0
+    current_orientation: float = 0.0
+    
+    # Ripples (Fine detail)
+    ripples_enabled:     bool  = True
+    ripples_wind_speed:  float = 8.0
+    ripples_wind_dir:    float = 0.0
+    ripples_chaos:       float = 0.8
+    
+    # ✨ Material & Scattering (HDRP-precise)
+    refraction_color: List[float] = field(default_factory=lambda: [0.10, 0.70, 0.85]) # Vibrant Cyan
+    scattering_color: List[float] = field(default_factory=lambda: [0.00, 0.40, 0.55]) # Tropical Deep
+    absorption_distance: float = 12.0
+    ambient_scattering:  float = 0.2
+    height_scattering:   float = 1.2
+    displacement_scattering: float = 0.5
+    direct_light_tip_scattering:  float = 1.0
+    direct_light_body_scattering: float = 0.8
+    
+    smoothness:          float = 0.98 # Very glossy
+    transparency:        float = 0.85 # More solid surface
+    reflection:          float = 1.0
+    
+    # 🧼 Foam
+    foam_enabled:    bool  = True
+    foam_amount:     float = 0.3
+    foam_smoothness: float = 1.0
+    
+    # 💎 Caustics
+    caustics_enabled:   bool  = True
+    caustics_intensity: float = 0.5
+    
+    # 🔥 Physics
+    storm_intensity: float = 0.0
+    buoyancy:        float = 0.8
 
 
 @dataclass
@@ -136,7 +208,10 @@ class SceneConfig:
     elev_max:  float =  90.0
     azim_min:  float =   0.0
     azim_max:  float = 360.0
-    fov_y:     float =  60.0
+    
+    # ── Camera Lens (Focal Length mm -> FOV) ──
+    focal_length: float = 50.0  # Standard 50mm lens
+    fov_y:        float = 26.99 # Calculated from focal_length (Standard 35mm Full Frame 24mm height)
 
     # ── Lighting ─────────────────────────────────────────────────
     brightness_min: float = 0.5
@@ -151,6 +226,7 @@ class SceneConfig:
     # ── Sub-configs ───────────────────────────────────────────────
     weather:      WeatherConfig     = field(default_factory=WeatherConfig)
     post_process: PostProcessConfig = field(default_factory=PostProcessConfig)
+    ocean:        OceanConfig       = field(default_factory=OceanConfig)
 
     def to_dict(self):
         from dataclasses import asdict

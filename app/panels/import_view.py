@@ -122,8 +122,8 @@ class ImportPanel(QWidget):
         self.setObjectName("import_panel")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(20)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
 
         # Title section
         title_row = QHBoxLayout()

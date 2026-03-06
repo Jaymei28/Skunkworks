@@ -673,3 +673,206 @@ class PreviewWorker(QThread):
         self._log("[Preview] Done.")
         self.preview_ready.emit(qi)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GL-based workers  —  use the same OpenGL shaders as the live viewport.
+# Drop-in replacements: identical Signal API to GeneratorWorker / PreviewWorker.
+# No PyTorch3D dependency.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GLPreviewWorker(QThread):
+    """
+    Renders a single composited frame using the GL offscreen renderer.
+    Replaces PreviewWorker — output is visually consistent with the live GL viewport.
+    """
+    preview_ready = Signal(QImage)
+    log_message   = Signal(str)
+    finished      = Signal()
+
+    def __init__(self, config, azim: float = 45.0, elev: float = 25.0,
+                 dist: float = 3.0, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.azim   = azim
+        self.elev   = elev
+        self.dist   = dist
+        # Surface must be created on the main thread
+        from app.engine.gl_offscreen_renderer import GLOffscreenRenderer
+        self._renderer = GLOffscreenRenderer(512, 512)
+
+    def run(self):
+        try:
+            self._renderer.init_gl()
+
+            cfg = self.config
+            if cfg.hdri_paths:
+                self._renderer.load_hdri(cfg.hdri_paths[0])
+
+            for obj in cfg.scene_objects:
+                if obj.config.mesh_path:
+                    self._renderer.load_mesh_from_path(
+                        obj.config.mesh_path, obj.config.tex_albedo)
+
+            frame_np, _ = self._renderer.render_frame(
+                cfg, self.azim, self.elev, self.dist, t=0.0)
+
+            h, w, _ = frame_np.shape
+            qi = QImage(frame_np.tobytes(), w, h, w * 3,
+                        QImage.Format.Format_RGB888).copy()
+            self.preview_ready.emit(qi)
+        except Exception:
+            tb = traceback.format_exc()
+            self.log_message.emit(f"[GLPreview Error] {tb}")
+        finally:
+            try:
+                self._renderer.cleanup()
+            except Exception:
+                pass
+            self.finished.emit()
+
+
+class GLGeneratorWorker(QThread):
+    """
+    Full batch generation pipeline using OpenGL — same renderer as the live preview.
+    Drop-in replacement for GeneratorWorker (identical Signal API).
+    """
+    progress      = Signal(int, int)
+    preview_ready = Signal(QImage)
+    log_message   = Signal(str)
+    finished      = Signal(bool, str)
+    stats_updated = Signal(dict)
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config  = config
+        self._stop   = False
+        self._paused = False
+        # Surface created on main thread
+        from app.engine.gl_offscreen_renderer import GLOffscreenRenderer
+        sz = config.image_size
+        self._renderer = GLOffscreenRenderer(sz, sz)
+
+    def stop(self):    self._stop   = True
+    def pause(self):   self._paused = True
+    def resume(self):  self._paused = False
+
+    def _log(self, msg: str):
+        self.log_message.emit(msg)
+
+    def run(self):
+        try:
+            self._run_generation()
+        except Exception:
+            tb = traceback.format_exc()
+            self._log(f"[ERROR] {tb}")
+            self.finished.emit(False, "GL generation failed — see log.")
+
+    def _run_generation(self):
+        import random as _rng
+        import json
+        cfg = self.config
+
+        self._log("[GL Init] Initialising OpenGL offscreen renderer…")
+        self._renderer.init_gl()
+        self._log("[GL Init] Context ready.")
+
+        # ── Output directories ────────────────────────────────────────────────
+        out_images = os.path.join(cfg.output_dir, "images")
+        out_labels = os.path.join(cfg.output_dir, "labels")
+        out_masks  = os.path.join(cfg.output_dir, "masks")
+        for d in [out_images, out_labels, out_masks]:
+            os.makedirs(d, exist_ok=True)
+
+        # ── Load HDRI ─────────────────────────────────────────────────────────
+        if cfg.hdri_paths:
+            hdri = _rng.choice(cfg.hdri_paths)
+            self._log(f"[GL Init] Loading HDRI: {os.path.basename(hdri)}")
+            self._renderer.load_hdri(hdri)
+
+        # ── Load meshes ───────────────────────────────────────────────────────
+        if not cfg.scene_objects:
+            self._log("[GL Init] No scene objects to render — aborting.")
+            self.finished.emit(False, "No scene objects in scene.")
+            return
+
+        loaded_paths = set()
+        for obj in cfg.scene_objects:
+            p = obj.config.mesh_path
+            if p and p not in loaded_paths:
+                self._log(f"[GL Init] Loading mesh: {os.path.basename(p)}")
+                self._renderer.load_mesh_from_path(p, obj.config.tex_albedo)
+                loaded_paths.add(p)
+
+        self._log(f"[GL Start] Generating {cfg.num_images} images → {cfg.output_dir}")
+        preview_every = max(1, cfg.num_images // 40)
+
+        for i in range(cfg.num_images):
+            # ── Pause / stop ──────────────────────────────────────────────────
+            while self._paused and not self._stop:
+                self.msleep(100)
+            if self._stop:
+                self._log("[Stopped] Generation cancelled.")
+                self.finished.emit(False, "Generation stopped.")
+                return
+
+            # ── Randomize camera pose ─────────────────────────────────────────
+            azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
+            elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
+            dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
+            t    = i * 0.12   # simulated time for wave animation
+
+            # ── Render ────────────────────────────────────────────────────────
+            frame_np, bboxes = self._renderer.render_frame(cfg, azim, elev, dist, t)
+
+            # ── Save image ────────────────────────────────────────────────────
+            name = f"{cfg.class_name.lower()}_{i:05d}"
+            try:
+                from PIL import Image
+                Image.fromarray(frame_np).save(os.path.join(out_images, name + ".png"))
+            except ImportError:
+                import cv2
+                cv2.imwrite(os.path.join(out_images, name + ".png"),
+                            cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
+
+            # ── Save YOLO labels ──────────────────────────────────────────────
+            label_lines = []
+            # Build class name → index map
+            cls_map: dict[str, int] = {}
+            idx_counter = 0
+            for cls_name, xc, yc, w, h in bboxes:
+                if cls_name not in cls_map:
+                    cls_map[cls_name] = idx_counter
+                    idx_counter += 1
+                label_lines.append(
+                    f"{cls_map[cls_name]} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+            label_path = os.path.join(out_labels, name + ".txt")
+            with open(label_path, "w") as f:
+                f.write("\n".join(label_lines))
+
+            # ── Signals ───────────────────────────────────────────────────────
+            self.progress.emit(i + 1, cfg.num_images)
+
+            if i % preview_every == 0:
+                h, w, _ = frame_np.shape
+                qi = QImage(frame_np.tobytes(), w, h, w * 3,
+                            QImage.Format.Format_RGB888).copy()
+                self.preview_ready.emit(qi)
+
+            if i % max(1, cfg.num_images // 20) == 0 or i == cfg.num_images - 1:
+                pct = (i + 1) / cfg.num_images * 100
+                self._log(f"[{pct:5.1f}%] {i+1}/{cfg.num_images}  "
+                          f"cam=az{azim:.0f}/el{elev:.0f}/d{dist:.0f}  "
+                          f"objs={len(bboxes)}")
+                self.stats_updated.emit({
+                    "generated": i + 1,
+                    "total":     cfg.num_images,
+                    "weather":   "—",
+                    "device":    "GL",
+                })
+
+        self._log(f"[GL Done] {cfg.num_images} images saved to {cfg.output_dir}")
+        try:
+            self._renderer.cleanup()
+        except Exception:
+            pass
+        self.finished.emit(True, f"Done! {cfg.num_images} images saved.")

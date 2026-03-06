@@ -31,8 +31,6 @@ class Sidebar(QWidget):
     page_changed = Signal(str)   # emits page key when user clicks
 
     PAGES = [
-        ("Models",        "models"),
-        ("HDRI",          "hdri"),
         ("Preview Scene", "preview"),
         ("Settings",      "settings"),
     ]

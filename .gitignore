@@ -38,3 +38,19 @@ HDRI/*.exr
 # OS
 .DS_Store
 Thumbs.db
+
+# Media
+*.mp4
+*.MOV
+
+# Scratch / Temp scripts
+patch_shaders*.py
+test_import.py
+
+# Internal / User Data
+/unity_skunkworks/
+/dataset_*/
+/output/
+
+# Logs
+*.log

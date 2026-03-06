@@ -18,6 +18,8 @@ import sys
 import struct
 import ctypes
 
+from app.engine.ocean_sim import ocean_physics
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Path Helper: ensure the project root is in sys.path so 'renderer' can be found.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,16 +48,24 @@ try:
         glEnableVertexAttribArray, glDrawArrays, glDrawElements,
         glGenTextures, glBindTexture, glTexImage2D, glTexParameteri,
         glGenerateMipmap, glActiveTexture, glPolygonMode,
-        glGetError, glIsVertexArray, glUniform1f, glUniform1i, glUniform3f,
+        glGetError, glIsVertexArray, glIsFramebuffer, glUniform1f, glUniform1i, glUniform3f,
         glUniformMatrix3fv, glUniformMatrix4fv,
         glDepthMask, glLineWidth, glUseProgram,
         glBlendFunc, glScissor,
+        glGenFramebuffers, glBindFramebuffer, glFramebufferTexture2D,
+        glGenRenderbuffers, glBindRenderbuffer, glRenderbufferStorage,
+        glFramebufferRenderbuffer,
+        glDeleteFramebuffers, glDeleteRenderbuffers,
+        glIsRenderbuffer,
         GL_NO_ERROR, GL_DEPTH_TEST, GL_LESS, GL_LEQUAL,
         GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT,
         GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_STATIC_DRAW, GL_DYNAMIC_DRAW,
         GL_FLOAT, GL_FALSE, GL_TRUE, GL_TRIANGLES, GL_UNSIGNED_INT, GL_LINE,
         GL_FILL, GL_FRONT_AND_BACK, GL_TEXTURE_2D, GL_RGB, GL_RGB16F,
         GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 
+        GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL_ATTACHMENT,
+        glFramebufferRenderbuffer,
         GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_LINEAR,
         GL_LINEAR_MIPMAP_LINEAR, GL_CLAMP_TO_EDGE, GL_TEXTURE0,
         GL_UNSIGNED_BYTE, GL_RGBA,
@@ -80,6 +90,18 @@ _fmt.setDepthBufferSize(24)
 _fmt.setSamples(4)
 QSurfaceFormat.setDefaultFormat(_fmt)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def is_valid_vao(vao_id):
+    """Check if a VAO ID is valid and exists in GL."""
+    if not vao_id or vao_id <= 0: return False
+    try:
+        from OpenGL.GL import glIsVertexArray
+        return glIsVertexArray(int(vao_id))
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PBR vertex shader
@@ -120,12 +142,22 @@ out vec4 FragColor;
 
 uniform vec3  uCamPos;
 uniform sampler2D uEnvMap;    // equirectangular HDR
+uniform sampler2D uAlbedoMap;
+uniform sampler2D uNormalMap;
+uniform bool  uHasAlbedoMap;
+uniform bool  uHasNormalMap;
+
 uniform vec3  uAlbedo;
 uniform float uMetallic;
 uniform float uRoughness;
-uniform float uEnvStrength;
-uniform vec3  uLightDir;       // world-space directional light (normalised)
 uniform float uLightIntensity; // key light radiance scale
+uniform float uEnvStrength;    // HDRI intensity
+uniform vec3  uLightDir;       // sun direction
+
+// --- Weather ---
+uniform int   uWeatherType;      // 0:clear, 1:cloudy, 2:rain, 3:stormy, 4:snow, 5:foggy
+uniform float uWeatherIntensity;
+uniform float uFogDensity;
 
 const float PI = 3.14159265359;
 
@@ -166,54 +198,311 @@ vec3 FresnelSchlickRoughness(float cosT, vec3 F0, float r){
 }
 
 void main(){
-    vec3  N    = normalize(vNormal);
     vec3  V    = normalize(uCamPos - vWorldPos);
-    float NdV  = max(dot(N,V),0.0);
+    
+    // ── Robust Normal Handling ──
+    vec3 N_geom = normalize(vNormal);
+    
+    // Double-sided lighting trick: if the normal points away from the camera, flip it.
+    // This solves issues with inverted geometry or viewing faces from behind.
+    if (dot(N_geom, V) < 0.0) N_geom = -N_geom;
 
-    vec3 F0 = mix(vec3(0.04), uAlbedo, uMetallic);
+    vec3 N;
+    if(uHasNormalMap){
+        // Planar TBN approx
+        vec3 Q1 = dFdx(vWorldPos);
+        vec3 Q2 = dFdy(vWorldPos);
+        vec2 st1 = dFdx(vUV);
+        vec2 st2 = dFdy(vUV);
+        
+        float det = (st1.x * st2.y - st1.y * st2.x);
+        if (abs(det) < 0.000001) {
+             N = N_geom;
+        } else {
+            vec3 T = normalize(Q1*st2.t - Q2*st1.t);
+            vec3 B = -normalize(cross(N_geom, T));
+            mat3 TBN = mat3(T, B, N_geom);
+            vec3 tangentNormal = texture(uNormalMap, vUV).rgb * 2.0 - 1.0;
+            N = normalize(TBN * tangentNormal);
+        }
+    } else {
+        N = N_geom;
+    }
+
+    float NdV  = max(dot(N,V), 0.001);
+
+    vec3 albedo = uAlbedo;
+    if(uHasAlbedoMap){
+        vec4 texColor = texture(uAlbedoMap, vUV);
+        albedo *= texColor.rgb;
+        if(texColor.a < 0.05) discard;
+    }
+    
+    albedo = max(albedo, vec3(0.01));
+
+    // --- Weather Surface Fix ---
+    float roughness = uRoughness;
+    if (uWeatherType == 2 || uWeatherType == 3) {
+        float wet = uWeatherIntensity * 0.7;
+        albedo *= (1.0 - wet * 0.3);
+        roughness = mix(roughness, 0.05, wet);
+    }
+    if (uWeatherType == 4) {
+        float snow = pow(clamp(N.y, 0.0, 1.0), 2.5) * uWeatherIntensity;
+        albedo = mix(albedo, vec3(0.92, 0.95, 1.0), snow * 0.9);
+        roughness = mix(roughness, 0.95, snow);
+    }
+
+    vec3 F0 = mix(vec3(0.04), albedo, uMetallic);
 
     // ── Key light (controllable direction) ───────────────────────────────────
     vec3  L0   = normalize(uLightDir);
     vec3  H0   = normalize(V + L0);
     vec3  rad0 = vec3(uLightIntensity);
 
-    float NDF  = DistributionGGX(N, H0, uRoughness);
-    float G    = GeometrySmith(N, V, L0, uRoughness);
+    float NDF  = DistributionGGX(N, H0, roughness);
+    float G    = GeometrySmith(N, V, L0, roughness);
     vec3  F    = FresnelSchlick(max(dot(H0,V),0.0), F0);
 
     vec3  num  = NDF * G * F;
     float den  = 4.0 * NdV * max(dot(N,L0),0.0) + 0.0001;
     vec3  spec = num / den;
 
-    vec3  kD   = (1.0 - F)*(1.0 - uMetallic);
-    vec3  Lo   = (kD * uAlbedo / PI + spec) * rad0 * max(dot(N,L0),0.0);
+    vec3  nD   = (1.0 - F)*(1.0 - uMetallic);
+    vec3  Lo   = (nD * albedo / PI + spec) * rad0 * max(dot(N,L0),0.0);
 
-    // ── IBL ambient (env map) ──────────────────────────────────────────────
-    vec3 kS_a  = FresnelSchlickRoughness(NdV, F0, uRoughness);
-    vec3 kD_a  = (1.0-kS_a)*(1.0-uMetallic);
+    // ── Indirect Lighting (IBL) ──
+    vec3 kS_a  = FresnelSchlickRoughness(NdV, F0, roughness);
+    vec3 kD_a  = (1.0 - kS_a) * (1.0 - uMetallic);
 
-    vec3 irrad  = sampleEnv(N, 4.0);           // diffuse: blurry sample
-    vec3 diffIBL = kD_a * irrad * uAlbedo;
+    vec3 irrad  = sampleEnv(N, 6.0);
+    vec3 diffIBL = kD_a * irrad * albedo;
 
     vec3 R        = reflect(-V, N);
-    float mipLvl  = uRoughness * 6.0;
-    vec3 prefilt  = sampleEnv(R, mipLvl);      // specular: glossy sample
+    vec3 prefilt  = sampleEnv(R, roughness * 7.0);
     vec3 specIBL  = (kS_a * prefilt);
 
-    vec3 ambient  = diffIBL + specIBL;
+    // --- Hemisphere-style Ambient fallback ---
+    // If no HDRI, we still want a "ground/sky" feel so objects are readable.
+    vec3 skyColor = vec3(0.18, 0.20, 0.25);
+    vec3 groundColor = vec3(0.08, 0.07, 0.05);
+    float hemi = N.y * 0.5 + 0.5;
+    vec3 hemiAmbient = mix(groundColor, skyColor, hemi) * albedo;
+    
+    vec3 ambient = (diffIBL + specIBL) + (hemiAmbient * 0.4) + vec3(0.02);
 
     vec3 color = Lo + ambient;
 
-    // ── Tone-map (ACES filmic) ─────────────────────────────────────────────
-    color = (color * (2.51*color + 0.03)) / (color * (2.43*color + 0.59) + 0.14);
-    color = clamp(color, 0.0, 1.0);
+    // ── Tone-map (ACES filmic) ── Improved saturation handling
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    color = clamp((color*(a*color+b))/(color*(c*color+d)+e), 0.0, 1.0);
 
     // ── Gamma correct ──────────────────────────────────────────────────────
     color = pow(color, vec3(1.0/2.2));
 
+    // ── Fog / Atmosphere ──
+    vec3 fogColor = vec3(0.4, 0.45, 0.5); 
+    if (uWeatherType == 2) fogColor = vec3(0.25, 0.3, 0.35); // Rain
+    if (uWeatherType == 3) fogColor = vec3(0.08, 0.1, 0.12); // Storm
+    if (uWeatherType == 4) fogColor = vec3(0.8, 0.85, 0.9);  // Snow
+
+    float dist = length(uCamPos - vWorldPos);
+    float fogFactor = 1.0 - exp(-dist * uFogDensity * (0.8 + uWeatherIntensity * 2.0));
+    color = mix(color, fogColor, clamp(fogFactor, 0.0, 1.0));
+
+    if (uWeatherType >= 1) {
+        float gray = dot(color, vec3(0.299, 0.587, 0.114));
+        color = mix(color, vec3(gray), uWeatherIntensity * 0.3);
+    }
+
     FragColor = vec4(color, 1.0);
 }
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ocean Shaders (Gerstner Waves + Water FX)
+# ─────────────────────────────────────────────────────────────────────────────
+_OCEAN_COMMON = """
+#version 330 core
+const float PI = 3.14159265359;
+uniform float uTime;
+uniform float uRepetitionSize;
+uniform float uWindSpeed;
+uniform float uWindDirection;
+uniform float uChoppiness;
+uniform float uWaveAmplitude;
+uniform float uBand0Multiplier;
+uniform float uBand1Multiplier;
+uniform float uLevel;
+uniform float uStorm;
+
+vec4 waves[8] = vec4[](
+    vec4(1.0, 0.5,  0.50, 1.2), vec4(0.8, 1.0,  0.45, 0.9), 
+    vec4(0.2, 1.2,  0.40, 0.7), vec4(-0.5, 0.8, 0.35, 0.5), 
+    vec4(0.1, -1.0, 0.30, 0.3), vec4(-0.7, -0.2, 0.25, 0.15), 
+    vec4(0.5, 0.5,  0.20, 0.08),vec4(-0.2, 0.8, 0.15, 0.04)  
+);
+
+void calculateWave(vec2 basePos, out vec3 displacement, out vec3 tangent, out vec3 binormal, out float height) {
+    displacement = vec3(0.0);
+    tangent = vec3(1.0, 0.0, 0.0);
+    binormal = vec3(0.0, 0.0, 1.0);
+    height = 0.0;
+
+    float windAngle = radians(uWindDirection);
+    mat2 windRot = mat2(cos(windAngle), -sin(windAngle), sin(windAngle), cos(windAngle));
+    
+    float globalAmp = (uWindSpeed / 10.0) * uWaveAmplitude;
+    float globalChop = uChoppiness * 1.8;
+
+    for(int i=0; i<8; i++){
+        vec4 w = waves[i];
+        vec2 dir = normalize(windRot * w.xy);
+        float bandMul = (i < 4) ? uBand0Multiplier : uBand1Multiplier;
+        float wavelength = w.w * uRepetitionSize * 0.2;
+        float k = 2.0 * PI / max(wavelength, 0.01);
+        float a = (wavelength / 40.0) * globalAmp * bandMul; 
+        float q = (w.z * globalChop) / (k * a * 8.0 + 0.001);
+        float speed = sqrt(9.81 / k);
+        float f = k * (dot(dir, basePos) - speed * uTime);
+        float cosF = cos(f); float sinF = sin(f);
+        displacement.x += q * a * dir.x * cosF;
+        displacement.y += a * sinF;
+        displacement.z += q * a * dir.y * cosF;
+        height += a * sinF;
+        float ksc = k * a * cosF; float kss = k * a * sinF;
+        tangent  += vec3(-q * dir.x * dir.x * kss, dir.x * ksc, -q * dir.x * dir.y * kss);
+        binormal += vec3(-q * dir.x * dir.y * kss, dir.y * ksc, -q * dir.y * dir.y * kss);
+    }
+}
+"""
+
+
+_OCEAN_VERT = _OCEAN_COMMON + """
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec2 aUV;
+out vec3 vWorldPos;
+out vec2 vUV;
+out float vTotalHeight;
+uniform mat4 uProj;
+uniform mat4 uView;
+void main(){
+    vec3 displacement, tangent, binormal;
+    float height;
+    calculateWave(aPos.xz, displacement, tangent, binormal, height);
+    vec3 p = aPos + displacement;
+    p.y += uLevel;
+    vWorldPos = p;
+    vTotalHeight = height;
+    vUV = aPos.xz; 
+    gl_Position = uProj * uView * vec4(p, 1.0);
+}
+"""
+
+
+_OCEAN_FRAG = _OCEAN_COMMON + """
+in vec3 vWorldPos;
+in vec2 vUV;
+in float vTotalHeight;
+out vec4 FragColor;
+uniform vec3  uCamPos;
+uniform vec3  uRefractionColor;
+uniform vec3  uScatteringColor;
+uniform float uAbsorptionDistance;
+uniform float uAmbientScattering;
+uniform float uDirectLightTipScattering;
+uniform float uDirectLightBodyScattering;
+uniform float uSmoothness;
+uniform float uTransparency;
+uniform sampler2D uEnvMap;
+uniform bool  uHasEnvMap;
+uniform float uEnvStrength;
+uniform vec3  uLightDir;
+uniform float uLightIntensity;
+uniform float uFogDensity;
+uniform bool  uRipplesEnabled;
+uniform float uRipplesWindSpeed;
+uniform float uRipplesWindDir;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+
+vec3 oceanRipples(vec2 uv, float time) {
+    vec3 n = vec3(0.0, 1.0, 0.0);
+    float freq = 6.0; float weight = 0.4;
+    for(int i=0; i<4; i++) {
+        vec2 d = vec2(sin(float(i)*1.5), cos(float(i)*1.5));
+        float h = sin(dot(uv, d * freq) + time * (1.2 + float(i)*0.1));
+        n.xz += d * h * weight * 0.15;
+        freq *= 2.0; weight *= 0.5;
+    }
+    return normalize(n);
+}
+
+float DistributionGGX(float NdH, float roughness) {
+    float a = roughness * roughness; float a2 = a * a;
+    float d = NdH * NdH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d + 0.00001);
+}
+float GeometrySmith(float NdV, float NdL, float roughness) {
+    float k = (roughness + 1.0); k = k * k / 8.0;
+    return (NdV/(NdV*(1.0-k)+k)) * (NdL/(NdL*(1.0-k)+k));
+}
+vec3 FresnelSchlick(float cosT, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
+}
+
+void main(){
+    vec3 displacement, tangent, binormal;
+    float height;
+    calculateWave(vUV, displacement, tangent, binormal, height);
+    vec3 N_geo = normalize(cross(binormal, tangent));
+    vec3 N = N_geo;
+    if (uRipplesEnabled) {
+        vec3 N_ripple = oceanRipples(vWorldPos.xz * 2.5, uTime);
+        N = normalize(mix(N_geo, N_ripple, 0.25));
+    }
+    vec3 V = normalize(uCamPos - vWorldPos);
+    vec3 L = normalize(uLightDir);
+    vec3 H = normalize(V + L);
+    float NdV = max(dot(N, V), 0.001);
+    float NdL = max(dot(N, L), 0.0);
+    float NdH = max(dot(N, H), 0.0);
+    float HdV = max(dot(H, V), 0.0);
+    float depth = clamp(-(vWorldPos.y - uLevel) / (uAbsorptionDistance + 0.1), 0.0, 1.0);
+    vec3 baseColor = mix(uRefractionColor, uScatteringColor * 0.3, 1.0 - exp(-depth * 5.0));
+    float crest = clamp(vTotalHeight / (uWaveAmplitude * 2.5 + 0.1), 0.0, 1.0);
+    float tipScat = pow(crest, 2.0) * pow(1.0 - NdV, 3.0) * uDirectLightTipScattering;
+    vec3 scattering = uScatteringColor * (uAmbientScattering + tipScat + uDirectLightBodyScattering * NdL);
+    vec3 colorBody = baseColor + scattering;
+    vec3 F0 = vec3(0.03); vec3 F = FresnelSchlick(NdV, F0);
+    vec3 reflection = vec3(0.0);
+    vec3 R_vec = reflect(-V, N);
+    if (uHasEnvMap) {
+        float p = atan(R_vec.z, R_vec.x); float t = acos(clamp(R_vec.y, -1.0, 1.0));
+        reflection = texture(uEnvMap, vec2(p/(2.0*PI)+0.5, t/PI)).rgb;
+    } else {
+        reflection = mix(vec3(0.2, 0.4, 0.6), vec3(0.7, 0.9, 1.0), pow(clamp(R_vec.y, 0.0, 1.0), 0.5));
+    }
+    reflection *= uEnvStrength;
+    float rough = max(1.0 - uSmoothness, 0.05);
+    float D = DistributionGGX(NdH, rough);
+    float G = GeometrySmith(NdV, NdL, rough);
+    vec3 spec = (D * G * FresnelSchlick(HdV, F0)) / (4.0 * NdV * NdL + 0.0001);
+    vec3 sunSpec = spec * vec3(uLightIntensity * 50.0) * NdL;
+    vec3 color = mix(colorBody, reflection, F) + sunSpec;
+    color = mix(color, vec3(0.9, 0.95, 1.0), smoothstep(0.7, 1.0, crest) * 0.3); // Foam
+    float fog = 1.0 - exp(-length(uCamPos - vWorldPos) * uFogDensity);
+    color = mix(color, vec3(0.5, 0.6, 0.7), clamp(fog, 0.0, 1.0));
+    color = color / (color + vec3(1.0));
+    color = pow(color, vec3(1.0 / 2.2));
+    FragColor = vec4(color, uTransparency);
+}
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Skybox (equirectangular) shaders
@@ -237,6 +526,12 @@ out vec4 FragColor;
 uniform sampler2D uEnvMap;
 uniform float     uEnvStrength;
 uniform float     uHdriRotation;  // radians, rotates HDRI yaw
+
+// --- Weather ---
+uniform int       uWeatherType;
+uniform float     uWeatherIntensity;
+uniform float     uThunderFlash;
+
 const float PI = 3.14159265359;
 void main(){
     vec3  d   = normalize(vDir);
@@ -244,11 +539,149 @@ void main(){
     float th  = asin(clamp(d.y, -1.0, 1.0));
     vec2  uv  = vec2(phi/(2.0*PI)+0.5, 1.0 - (th/PI+0.5));
     vec3  col = texture(uEnvMap, uv).rgb * uEnvStrength;
+
+    // Apply weather darkening/tinting to sky
+    if (uWeatherType == 1) col *= mix(1.0, 0.7, uWeatherIntensity); // Cloudy
+    if (uWeatherType == 2) col *= mix(1.0, 0.5, uWeatherIntensity); // Rain
+    if (uWeatherType == 3) col *= mix(1.0, 0.2, uWeatherIntensity); // Stormy
+    if (uWeatherType == 4) col *= mix(1.0, 0.9, uWeatherIntensity); // Snow
+    if (uWeatherType == 5) col *= mix(1.0, 0.6, uWeatherIntensity); // Foggy
+
     // filmic tone-map
     col = (col*(2.51*col+0.03))/(col*(2.43*col+0.59)+0.14);
     col = clamp(col, 0.0, 1.0);
     col = pow(col, vec3(1.0/2.2));
+    // --- Thunder Flash ---
+    if (uWeatherType == 3 && uThunderFlash > 0.0) {
+        col += vec3(uThunderFlash * 1.5);
+    }
+
     FragColor = vec4(col, 1.0);
+}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weather Overlay Shader (Rain / Snow / Thunder)
+# ─────────────────────────────────────────────────────────────────────────────
+_WEATHER_VERT = """
+#version 330 core
+layout(location=0) in vec3 aPos;
+out vec2 vUV;
+void main(){
+    vUV = aPos.xy * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 1.0);
+}
+"""
+
+_WEATHER_FRAG = """
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+
+uniform float uTime;
+uniform int   uWeatherType;
+uniform float uWeatherIntensity;
+uniform float uAspect;
+uniform float uThunderFlash;
+uniform vec3  uCamPos;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform vec3  uCamFwd;
+
+float hash(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+void main() {
+    // Start with a clean transparent color
+    vec4 col = vec4(0.0);
+    
+    // View ray reconstruction
+    vec2 p = (vUV * 2.0 - 1.0) * vec2(uAspect, 1.0);
+    vec3 rd = normalize(uCamFwd + uCamRight * p.x + uCamUp * p.y);
+    float t = uTime;
+
+    // --- Weather Volume Rendering (Planar Ray-Casting) ---
+    // This removes the "spinning" distortion seen with spherical shells.
+    float cosView = dot(rd, uCamFwd);
+    if (cosView > 0.0) {
+        // --- Rain (Type 2: rain, Type 3: stormy) ---
+        if (uWeatherType == 2 || uWeatherType == 3) {
+            float rainTime = t * 6.0; 
+            for (int i = 0; i < 5; i++) {
+                float layer = float(i) + 1.0;
+                float dist = 1.0 + layer * 2.0;
+                float planeDist = dist / cosView;
+                
+                vec3 worldPos = uCamPos + rd * planeDist;
+                
+                // Lower resolution = bigger drops
+                float res = 6.0 + layer * 3.0; 
+                vec3 boxPos = worldPos * res;
+                boxPos.y += rainTime * (3.0 + layer * 0.5);
+                boxPos.x += boxPos.y * 0.035; 
+                
+                vec3 ip = floor(boxPos);
+                vec3 fp = fract(boxPos);
+                float h = hash(ip + layer * 19.7);
+                
+                if (h > 0.98 - uWeatherIntensity * 0.07) {
+                    // Rain drop: wider streaks
+                    float drop = smoothstep(0.12, 0.0, abs(fp.x - 0.5));
+                    drop *= smoothstep(0.15, 0.0, abs(fp.z - 0.5));
+                    drop *= smoothstep(0.0, 0.2, fp.y) * smoothstep(1.0, 0.2, fp.y);
+                    
+                    float alpha = drop * (0.4 + uWeatherIntensity * 0.6);
+                    col += vec4(0.85, 0.9, 1.0, alpha * 0.7);
+                }
+            }
+        }
+
+        // --- Snow (Type 4) ---
+        if (uWeatherType == 4) {
+            float snowTime = t * 1.5;
+            for (int i = 0; i < 4; i++) {
+                float layer = float(i) + 1.0;
+                float dist = 2.0 + layer * 3.5;
+                float planeDist = dist / cosView;
+                
+                vec3 worldPos = uCamPos + rd * planeDist;
+                
+                float res = 4.0 + layer * 1.2;
+                vec3 boxPos = worldPos * res;
+                boxPos.y += snowTime * (1.1 - layer * 0.1);
+                boxPos.xz += sin(snowTime * 0.5 + worldPos.y * 0.1) * 0.4;
+                
+                vec3 ip = floor(boxPos);
+                vec3 fp = fract(boxPos);
+                float h = hash(ip + layer * 37.1);
+                
+                if (h > 0.96 - uWeatherIntensity * 0.1) {
+                    float streak = 0.4 + layer * 0.3;
+                    float d = length((fp - 0.5) / vec3(1.0, 1.0 + streak, 1.0));
+                    float rSize = 0.06 + 0.1 * hash(ip + 13.3);
+                    
+                    float glow = exp(-d * 7.0) * 0.5;
+                    float core = smoothstep(rSize, rSize * 0.5, d);
+                    
+                    vec3 snowCol = vec3(1.0);
+                    float alpha = (core + glow) * (0.3 + uWeatherIntensity * 0.7);
+                    col.rgb += snowCol * alpha;
+                    col.a += alpha * 0.4;
+                }
+            }
+        }
+    }
+
+    // --- Stormy Lighting (Flash) ---
+    if (uWeatherType == 3 && uThunderFlash > 0.01) {
+        col += vec4(0.95, 1.0, 1.0, uThunderFlash * 0.5);
+    }
+
+    col = clamp(col, 0.0, 1.0);
+    FragColor = col;
 }
 """
 
@@ -339,6 +772,70 @@ void main(){
     if(abs(worldPos.z) < 0.03) color = mix(color, vec3(0.2, 0.2, 0.8), 0.9);
     
     FragColor = vec4(color * fade, g * fade * 0.5);
+}
+"""
+
+_PP_VERT = """
+#version 330 core
+layout(location=0) in vec3 aPos;
+out vec2 vUV;
+void main(){
+    vUV = aPos.xy * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 1.0);
+}
+"""
+
+_PP_FRAG = """
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+
+uniform sampler2D uScreenTex;
+uniform bool  uFisheyeEnabled;
+uniform float uFisheyeStrength;
+uniform float uAspect;
+
+void main(){
+    vec2 uv = vUV;
+    
+    if(uFisheyeEnabled){
+        // Normalized coordinates centered at 0 [-1, 1]
+        vec2 p = vUV * 2.0 - 1.0;
+        
+        // Correct for aspect ratio to keep the lens circular
+        p.x *= uAspect;
+        
+        float d = length(p);
+        
+        // True panoramic fisheye mapping
+        // Curvilinear distortion (Equidistant-ish approximation)
+        // Strength scales how 'tight' the fisheye wrap is
+        float k = uFisheyeStrength * 1.5;
+        float nr = atan(d * k) / k;
+        
+        if (d > 0.001) {
+             p = (p / d) * nr;
+        }
+        
+        // Re-apply aspect and bring back to [0, 1]
+        p.x /= uAspect;
+        uv = p * 0.5 + 0.5;
+        
+        // Smooth vignette mask based on original radius
+        // The vignette should scale with aspect
+        float bind = (uAspect > 1.0) ? uAspect : 1.0;
+        float vignette = smoothstep(bind * 1.1, bind * 1.0, d);
+        
+        // Sample screen texture with wrap check
+        if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        } else {
+            vec3 col = texture(uScreenTex, uv).rgb;
+            FragColor = vec4(col * vignette, 1.0);
+        }
+    } else {
+        FragColor = texture(uScreenTex, uv);
+    }
 }
 """
 
@@ -547,6 +1044,10 @@ class _OverlayWidget(QWidget):
 
 class GL3DPreview(QOpenGLWidget):
     """OpenGL 3.3 core preview — PBR + HDR environment."""
+    camera_active    = Signal()
+    object_selected  = Signal(object)
+    object_moved     = Signal(object)
+    texture_discovered = Signal(str, str) # mesh_path, albedo_path
 
     def __init__(self, parent=None):
         # Format already applied at module level (see _fmt above).
@@ -590,7 +1091,15 @@ class GL3DPreview(QOpenGLWidget):
         # Display state
         self._wireframe  = False
         self._env_strength = 1.0
-        self._hdri_rotation = 0.0        # degrees
+        self._hdri_rotation = 0.0
+
+        # Mesh Storage
+        self._mesh_cache = {} # path -> {vao, vbo, ebo, count, albedo, normal}
+        self._pending_uploads = [] # list of mesh paths
+
+        self._obj_offset = [0.0, 0.0, 0.0]
+        self._obj_rotation = [0.0, 0.0, 0.0]
+        self._obj_scale = 1.0
         self._albedo     = [0.9, 0.35, 0.15]   # default: rusty orange
         self._metallic   = 0.1
         self._roughness  = 0.45
@@ -599,8 +1108,6 @@ class GL3DPreview(QOpenGLWidget):
         self._light_elev  = 60.0          # degrees above horizon
         self._light_intensity = 2.8       # PBR radiance scale
         # Object transform
-        self._obj_offset  = [0.0, 0.0, 0.0]  # world-space XYZ offset
-        self._obj_scale   = 1.0               # uniform scale multiplier
         # Mesh / HDRI paths
         self._mesh_verts = None
         self._mesh_idx   = None
@@ -611,6 +1118,15 @@ class GL3DPreview(QOpenGLWidget):
         self._env_needs_reload  = False
         self._mesh_needs_upload = False
         self._preview_pixmap: QPixmap | None = None
+        self._albedo_tex = None # Default texture for fallback sphere
+
+        # Caching
+        self._mesh_cache = {}    # mesh_path -> {vao, vbo, ebo, count, bbox}
+        self._texture_cache = {} # file_path -> texture_id
+
+        # Scene state reference
+        self.cfg = None
+        self._selected_obj = None
 
         # GL objects (initialised in initializeGL)
         self._prog = self._sky_prog = None
@@ -620,6 +1136,12 @@ class GL3DPreview(QOpenGLWidget):
         self._sphere_idx_count = 0
         self._sky_idx_count    = 0
         self._gl_ready = False
+
+        # Post-Process FBO
+        self._pp_fbo = None
+        self._pp_tex = None
+        self._pp_depth = None
+        self._pp_prog = None
 
         # 60 fps inertia / animation timer
         self._timer = QTimer(self)
@@ -638,7 +1160,6 @@ class GL3DPreview(QOpenGLWidget):
         self._gizmo_drag_start_offset = [0.0, 0.0, 0.0]
         self._gizmo_drag_start_scale = 1.0
         self._gizmo_drag_start_angle = 0.0    # for rotate mode
-        self._obj_rotation = [0.0, 0.0, 0.0]  # Euler angles (degrees) X, Y, Z
         # Gizmo GL resources
         self._gizmo_prog = None
         self._gizmo_vao = self._gizmo_vbo = None
@@ -647,6 +1168,12 @@ class GL3DPreview(QOpenGLWidget):
         self._obj_selected = False
 
         self.setMouseTracking(True)  # needed for hover detection
+        self._discovered_textures = {} # mesh_path -> albedo_path
+
+        # ── Ocean Resources ──────────────────────────────────────────────────
+        self._ocean_prog = None
+        self._ocean_vao = self._ocean_vbo = self._ocean_ebo = None
+        self._ocean_idx_count = 0
 
     # ── Camera helpers ────────────────────────────────────────────────────────
 
@@ -673,6 +1200,14 @@ class GL3DPreview(QOpenGLWidget):
     def set_azim_elev(self, azim, elev):
         self._azim  = azim
         self._elev  = elev    # no clamp — full 360° orbit
+        self.update()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        # Scale zoom sensitivity by distance (closer = slower)
+        speed = 1.15 if delta < 0 else 0.85
+        self._dist *= speed
+        self._dist = max(0.1, min(self._dist, 4500.0))
         self.update()
 
     def reset_camera(self):
@@ -759,38 +1294,152 @@ class GL3DPreview(QOpenGLWidget):
         self._overlay.set_pixmap(self._preview_pixmap)
 
     def load_obj_mesh(self, path: str):
-        """Set mesh path. GPU upload is deferred to the next paintGL frame."""
-        if not HAS_OPENGL or not path or not os.path.exists(path):
+        """Set mesh path for pre-loading. Actual render loop uses cfg.scene_objects."""
+        if not path or not os.path.exists(path):
             return
-        self._pending_mesh_path = path
-        if not self._gl_ready:
-            return   # initializeGL will flush _pending_mesh_path
-        self._mesh_needs_upload = True
+        if not HAS_OPENGL:
+            return
+
+        if path not in self._mesh_cache and path not in self._pending_uploads:
+            self._pending_uploads.append(path)
+            self._mesh_needs_upload = True
+        elif path in self._discovered_textures:
+            # Mesh already loaded, but we should still emit discovery if we found one
+            self.texture_discovered.emit(path, self._discovered_textures[path])
         self.update()
+
+    def set_scene_config(self, cfg):
+        self.cfg = cfg
+        self.update()
+
+    def set_selected_object(self, obj):
+        self._selected_obj = obj
+        self.update()
+
 
     def _do_upload_mesh(self, path: str):
         """
-        Internal: load + upload one mesh from disk.  Called only from paintGL
-        so the GL context is always active.  Never call directly from UI code.
+        Internal: load + upload one mesh from disk.
         """
-        from renderer.loader import MeshLoader
+        from app.engine.mesh_loader import load_mesh
         import numpy as np
 
-        mesh = MeshLoader.load(path, device="cpu")
-        v = mesh.verts_padded().cpu().numpy()[0].astype(np.float32)
-        f = mesh.faces_padded().cpu().numpy()[0].astype(np.uint32)
-
-        # Normalise to fit camera orbit (dist=3.0 → 1.5-unit diameter)
-        v_min, v_max = v.min(axis=0), v.max(axis=0)
-        v -= (v_min + v_max) / 2.0
-        v *= 1.5 / max(float(np.linalg.norm(v_max - v_min)), 0.001)
-
+        print(f"[GL] _do_upload_mesh: loading {path!r}")
         try:
-            n = mesh.verts_normals_padded().cpu().numpy()[0].astype(np.float32)
-        except Exception:
-            n = None
+            loaded = load_mesh(path)
+        except Exception as e:
+            print(f"[GL] Failed to load mesh {path}: {e}")
+            return
 
-        self._upload_custom_mesh(v, f, n)
+        v_raw = loaded.vertices
+        f = loaded.indices
+        n_raw = loaded.normals if loaded.normals.size else None
+        u = loaded.uvs if loaded.uvs.size else None
+
+        # Normalize: Center and scale the mesh so it's ~1.0 unit tall at origin
+        # This solves the "vanishing object" problem for models with huge offsets or tiny scales.
+        v = (v_raw - loaded.center) * loaded.scale_hint
+        # Normals don't need translation, and scale is uniform so normalize is enough
+        n = n_raw # will be normalized in shader too
+
+        # Upload using a dedicated helper that returns mesh resource info
+        resource = self._create_mesh_resource(v, f, n, u, loaded.tex_albedo)
+        if resource:
+            self._mesh_cache[path] = resource
+            print(f"[GL] Mesh {os.path.basename(path)} cached: {len(v)} verts, {len(f)//3} tris.")
+            if loaded.tex_albedo:
+                self._discovered_textures[path] = loaded.tex_albedo
+                self.texture_discovered.emit(path, loaded.tex_albedo)
+
+    def _create_mesh_resource(self, vertices, faces, normals, uvs, albedo_path=None):
+        """Create OpenGL buffers for a mesh and upload its default albedo."""
+        if not HAS_OPENGL:
+            return None
+        import numpy as np
+        from OpenGL.GL import (
+            glGenVertexArrays, glBindVertexArray, glGenBuffers, glBindBuffer,
+            glBufferData, GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER, GL_STATIC_DRAW,
+            glGenTextures, glBindTexture, glTexImage2D, glTexParameteri,
+            glGenerateMipmap, GL_TEXTURE_2D, GL_RGB, GL_UNSIGNED_BYTE,
+            GL_LINEAR, GL_CLAMP_TO_EDGE, glActiveTexture, GL_TEXTURE0, GL_TEXTURE1,
+            glVertexAttribPointer, glEnableVertexAttribArray, GL_FLOAT, GL_LINEAR_MIPMAP_LINEAR, GL_RGBA
+        )
+        from PySide6.QtGui import QImage
+
+        vao = int(glGenVertexArrays(1))
+        vbo = int(glGenBuffers(1))
+        ebo = int(glGenBuffers(1))
+
+        glBindVertexArray(vao)
+
+        # FAST interleaving using numpy (instead of Python loops)
+        count = len(vertices)
+        # Interleave: Pos(3), Norm(3), UV(2) = 8 floats
+        v_arr = np.zeros((count, 8), dtype=np.float32)
+        v_arr[:, 0:3] = vertices
+        if normals is not None and len(normals) == count:
+            v_arr[:, 3:6] = normals
+        else:
+            # Default normal: Up
+            v_arr[:, 4] = 1.0
+        
+        if uvs is not None and len(uvs) == count:
+            v_arr[:, 6:8] = uvs
+
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, v_arr.nbytes, v_arr, GL_STATIC_DRAW)
+
+        f_arr = np.array(faces, dtype=np.uint32)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, f_arr.nbytes, f_arr, GL_STATIC_DRAW)
+
+        stride = 8 * 4
+        # Positions
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+        # Normals
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+        # UVs
+        glEnableVertexAttribArray(2)
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(24))
+
+        glBindVertexArray(0)
+
+        # Handle albedo
+        tex_id = None
+        if albedo_path and os.path.exists(albedo_path):
+            tex_id = self._get_or_create_texture(albedo_path)
+
+        return {
+            "vao": vao, "vbo": vbo, "ebo": ebo, 
+            "count": len(faces),
+            "albedo": tex_id
+        }
+
+    def _get_or_create_texture(self, path):
+        if not path or not os.path.exists(path):
+            return None
+        if path in self._texture_cache:
+            return self._texture_cache[path]
+        
+        try:
+            from PySide6.QtGui import QImage
+            img = QImage(path).convertToFormat(QImage.Format.Format_RGBA8888)
+            if img.isNull(): return None
+
+            tid = int(glGenTextures(1))
+            glBindTexture(GL_TEXTURE_2D, tid)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, img.bits().tobytes())
+            glGenerateMipmap(GL_TEXTURE_2D)
+            
+            self._texture_cache[path] = tid
+            return tid
+        except Exception as e:
+            print(f"[GL] Texture upload failed for {path}: {e}")
+            return None
 
     # ── Phase 5 — Safe GPU teardown + reinit ───────────────────────────────
 
@@ -805,16 +1454,32 @@ class GL3DPreview(QOpenGLWidget):
         self.makeCurrent()   
         try:
             from OpenGL.GL import glDeleteTextures, glDeleteVertexArrays, glDeleteBuffers
-            tex = self._env_tex
-            if tex is not None:
-                glDeleteTextures(1, [int(tex)])
+            tex_to_delete = []
+            if self._env_tex is not None:
+                tex_to_delete.append(int(self._env_tex))
                 self._env_tex = None
+            if self._albedo_tex is not None: # For fallback sphere
+                tex_to_delete.append(int(self._albedo_tex))
+                self._albedo_tex = None
+            for mesh_res in self._mesh_cache.values():
+                if mesh_res["albedo"] is not None:
+                    tex_to_delete.append(int(mesh_res["albedo"]))
+            if tex_to_delete:
+                glDeleteTextures(len(tex_to_delete), tex_to_delete)
             
             vaos = [int(v) for v in [self._sphere_vao, self._sky_vao, self._grid_vao] if v is not None]
+            for mesh_res in self._mesh_cache.values():
+                if mesh_res["vao"] is not None:
+                    vaos.append(int(mesh_res["vao"]))
             if vaos:
                 glDeleteVertexArrays(len(vaos), vaos)
                 
             bufs = [int(b) for b in [self._sphere_vbo, self._sphere_ebo, self._sky_vbo, self._sky_ebo, self._grid_vbo] if b is not None]
+            for mesh_res in self._mesh_cache.values():
+                if mesh_res["vbo"] is not None:
+                    bufs.append(int(mesh_res["vbo"]))
+                if mesh_res["ebo"] is not None:
+                    bufs.append(int(mesh_res["ebo"]))
             if bufs:
                 glDeleteBuffers(len(bufs), bufs)
         except Exception as exc:
@@ -825,6 +1490,7 @@ class GL3DPreview(QOpenGLWidget):
         self._sky_vbo    = self._sky_ebo    = None
         self._grid_vbo   = None
         self._env_tex    = None
+        self._mesh_cache = {} # Clear cache
         self._prog = self._sky_prog = None
         self._gl_ready = False
         if self._hdri_path:
@@ -852,10 +1518,9 @@ class GL3DPreview(QOpenGLWidget):
         # Always clear the static preview overlay on any click
         if hasattr(self, '_overlay'):
             self._overlay.clear()
-        # Notify parent to stop idle rendering
-        parent = self.parentWidget()
-        if hasattr(parent, "_on_gl_drag_start"):
-            parent._on_gl_drag_start()
+        # Notify stop idle rendering
+        self.camera_active.emit()
+
 
         if event.button() == Qt.MouseButton.RightButton:
             # RMB = Enter flythrough mode
@@ -874,33 +1539,32 @@ class GL3DPreview(QOpenGLWidget):
             if self._gizmo_mode == 'view':
                 self._dragging = True
                 self._last_pos = pos
-                self._last_drag_delta = QPointF(0, 0)
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 return
 
             # Other modes: try gizmo first (only if object is selected)
-            if self._obj_selected:
+            if self._selected_obj:
                 axis = self._gizmo_hit_test(pos.x(), pos.y())
                 if axis:
                     self._gizmo_active_axis = axis
                     self._gizmo_drag_start_pos = pos
-                    self._gizmo_drag_start_offset = list(self._obj_offset)
-                    self._gizmo_drag_start_scale = self._obj_scale
-                    self._gizmo_drag_start_angle = 0.0
+                    self._gizmo_drag_start_offset = [self._selected_obj.pos_x, self._selected_obj.pos_y, self._selected_obj.pos_z]
+                    self._gizmo_drag_start_scale = self._selected_obj.scale
+                    self._gizmo_drag_start_angle = 0.0 # Placeholder
                     self.setCursor(Qt.CursorShape.SizeAllCursor)
-                    if hasattr(self, '_overlay'):
-                        self._overlay.clear()
                     return
 
-            # Try clicking on the object to select it
-            if self._hit_test_object(pos.x(), pos.y()):
-                self._obj_selected = True
+            # Try clicking on an object to select it
+            hit_obj = self._hit_test_all_objects(pos.x(), pos.y())
+            if hit_obj:
+                self._selected_obj = hit_obj
+                self.object_selected.emit(hit_obj)
                 self.update()
                 return
 
             # Clicked empty space — deselect
-            if self._obj_selected:
-                self._obj_selected = False
+            if self._selected_obj:
+                self._selected_obj = None
+                self.object_selected.emit(None)
                 self.update()
                 return
 
@@ -909,9 +1573,8 @@ class GL3DPreview(QOpenGLWidget):
             self._last_pos = pos
             self._last_drag_delta = QPointF(0, 0)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            parent = self.parentWidget()
-            if hasattr(parent, "_on_gl_drag_start"):
-                parent._on_gl_drag_start()
+            self.camera_active.emit()
+
         elif event.button() == Qt.MouseButton.MiddleButton:
             mods = event.modifiers()
             if mods & Qt.KeyboardModifier.ShiftModifier:
@@ -964,8 +1627,8 @@ class GL3DPreview(QOpenGLWidget):
             cam_world = self._camera_pos()
 
             # Rotate view direction (inverted for orbit model → FPS feel)
-            self._azim -= delta.x() * 0.25
-            self._elev += delta.y() * 0.25
+            self._azim -= delta.x() * 0.15
+            self._elev += delta.y() * 0.15
             self._elev = max(-89.0, min(89.0, self._elev))
 
             # Recompute target so camera stays at the same world position
@@ -981,7 +1644,7 @@ class GL3DPreview(QOpenGLWidget):
             # Shift+MMB walk: mouse-up/down = move up/down, left/right = strafe
             delta = pos - self._last_pos
             self._last_pos = pos
-            speed = self._dist * 0.003
+            speed = self._dist * 0.001
             az = math.radians(self._azim)
             # Right vector (horizontal strafe)
             r_x =  math.cos(az)
@@ -993,21 +1656,23 @@ class GL3DPreview(QOpenGLWidget):
             self._target[1] += move_up
             self._target[2] += move_right * r_z
             self.update()
-        elif self._gizmo_active_axis:
-            # Constrained drag along the active axis
-            self._gizmo_apply_drag(pos)
+        elif self._gizmo_active_axis and self._selected_obj:
+            delta = pos - self._gizmo_drag_start_pos
+            self._on_gizmo_drag(delta.x(), delta.y())
             self.update()
+            return
         elif self._dragging:
             delta = pos - self._last_pos
             self._last_drag_delta = delta
             self._last_pos = pos
-            self._azim += delta.x() * 0.4
-            self._elev -= delta.y() * 0.4
+            self._azim += delta.x() * 0.12 # Reduced from 0.15
+            self._elev -= delta.y() * 0.12 # Reduced from 0.15
             self.update()
         elif getattr(self, '_panning', False):
             delta = pos - self._last_pos
             self._last_pos = pos
-            speed = self._dist * 0.002
+            # Pan sensitivity scales with distance
+            sens = 0.0008 * self._dist
             # Compute proper camera right & up from azimuth + elevation
             az = math.radians(self._azim)
             el = math.radians(self._elev)
@@ -1035,7 +1700,7 @@ class GL3DPreview(QOpenGLWidget):
                 self.update()
 
     def wheelEvent(self, event):
-        self._dist = max(0.5, min(20.0, self._dist - event.angleDelta().y() * 0.005))
+        self._dist = max(0.5, min(20.0, self._dist - event.angleDelta().y() * 0.002))
         self.update()
 
     def keyPressEvent(self, event):
@@ -1120,7 +1785,8 @@ class GL3DPreview(QOpenGLWidget):
 
     def _gizmo_axis_endpoints(self):
         """Return world-space start/end for each gizmo axis."""
-        ox, oy, oz = self._obj_offset
+        if not self._selected_obj: return {}
+        ox, oy, oz = self._selected_obj.pos_x, self._selected_obj.pos_y, self._selected_obj.pos_z
         length = 0.8  # fixed arm length matching _draw_gizmo
         return {
             'x': ([ox, oy, oz], [ox + length, oy, oz]),
@@ -1128,70 +1794,71 @@ class GL3DPreview(QOpenGLWidget):
             'z': ([ox, oy, oz], [ox, oy, oz + length]),
         }
 
-    def _hit_test_object(self, mx, my):
-        """Test if mouse click hits the object (ray-sphere intersection)."""
-        if not self._gl_ready:
-            return False
+    def _hit_test_all_objects(self, mx, my):
+        if not getattr(self, 'cfg', None): return None
+        # Returns the closest hit object (if any)
+        best_obj = None
+        best_dist = 1e9
+        for obj in self.cfg.scene_objects:
+            if obj.visible and self._hit_test_object(mx, my, obj):
+                # Simple distance check from camera
+                cam = self._camera_pos()
+                dist = math.sqrt((obj.pos_x-cam[0])**2 + (obj.pos_y-cam[1])**2 + (obj.pos_z-cam[2])**2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_obj = obj
+        return best_obj
+
+    def _hit_test_object(self, mx, my, obj):
+        if not self._gl_ready or not obj: return False
         W, H = self.width(), self.height()
-        if W < 1 or H < 1:
-            return False
-
+        if W < 1 or H < 1: return False
+        
         aspect = W / max(H, 1)
-        proj = _mat4_perspective(60.0, aspect, 0.1, 5000.0)
-        eye  = self._camera_pos()
-        up   = self._camera_up()
-        view = _lookat(eye, self._target, up)
+        fov = self.cfg.fov_y if (self.cfg and hasattr(self.cfg, 'fov_y')) else 60.0
+        proj = _mat4_perspective(fov, aspect, 0.1, 5000.0)
+        view = _lookat(self._camera_pos(), self._target, self._camera_up())
+        inv_vp = _mat4_inverse(_mat4_mul(proj, view))
 
-        # Convert mouse position to NDC
         ndc_x = (2.0 * mx / W) - 1.0
         ndc_y = 1.0 - (2.0 * my / H)
-
-        # Unproject near and far points
-        vp = _mat4_mul(proj, view)
-        inv_vp = _mat4_inverse(vp)
-
-        near_ndc = [ndc_x, ndc_y, -1.0, 1.0]
-        far_ndc  = [ndc_x, ndc_y,  1.0, 1.0]
-
-        near_world = _mat4_vec4_mul(inv_vp, near_ndc)
-        far_world  = _mat4_vec4_mul(inv_vp, far_ndc)
-
-        if abs(near_world[3]) < 1e-9 or abs(far_world[3]) < 1e-9:
-            return False
-
-        near_w = [near_world[i] / near_world[3] for i in range(3)]
-        far_w  = [far_world[i]  / far_world[3]  for i in range(3)]
-
-        # Ray direction
-        ray_dir = [far_w[i] - near_w[i] for i in range(3)]
+        
+        near_world = _mat4_vec4_mul(inv_vp, [ndc_x, ndc_y, -1.0, 1.0])
+        far_world  = _mat4_vec4_mul(inv_vp, [ndc_x, ndc_y,  1.0, 1.0])
+        
+        if abs(near_world[3]) < 1e-9 or abs(far_world[3]) < 1e-9: return False
+        
+        near_w = [near_world[i]/near_world[3] for i in range(3)]
+        far_w  = [far_world[i]/far_world[3] for i in range(3)]
+        
+        ray_dir = [far_w[i]-near_w[i] for i in range(3)]
         ray_len = math.sqrt(sum(d*d for d in ray_dir))
-        if ray_len < 1e-9:
-            return False
-        ray_dir = [d / ray_len for d in ray_dir]
+        if ray_len < 1e-9: return False
+        ray_dir = [d/ray_len for d in ray_dir]
+        
+        center = [obj.pos_x, obj.pos_y, obj.pos_z]
+        radius = obj.scale * 1.5
+        
+        L = [center[i] - near_w[i] for i in range(3)]
+        tca = sum(L[i] * ray_dir[i] for i in range(3))
+        if tca < 0: return False
+        d2 = sum(L[i]*L[i] for i in range(3)) - tca*tca
+        return d2 < (radius*radius)
 
-        # Sphere center = object offset, radius = object scale
-        center = self._obj_offset
-        radius = self._obj_scale
 
-        # Ray-sphere intersection: |O + tD - C|^2 = r^2
-        oc = [near_w[i] - center[i] for i in range(3)]
-        a = sum(ray_dir[i]**2 for i in range(3))
-        b = 2.0 * sum(oc[i] * ray_dir[i] for i in range(3))
-        c = sum(oc[i]**2 for i in range(3)) - radius**2
-        disc = b*b - 4*a*c
 
-        return disc >= 0
 
     def _gizmo_hit_test(self, mx, my):
         """Return 'x'/'y'/'z'/'free' if mouse is near a gizmo axis, else None."""
-        if not self._gl_ready:
+        if not self._gl_ready or not self._selected_obj:
             return None
         W, H = self.width(), self.height()
         if W < 1 or H < 1:
             return None
 
         aspect = W / max(H, 1)
-        proj = _mat4_perspective(60.0, aspect, 0.1, 500.0)
+        fov = self.cfg.fov_y if (self.cfg and hasattr(self.cfg, 'fov_y')) else 60.0
+        proj = _mat4_perspective(fov, aspect, 0.1, 500.0)
         eye  = self._camera_pos()
         up   = self._camera_up()
         view = _lookat(eye, self._target, up)
@@ -1203,12 +1870,12 @@ class GL3DPreview(QOpenGLWidget):
 
         # Check center box first (free movement handle)
         if self._gizmo_mode == 'translate':
-            ox, oy, oz = self._obj_offset
-            center_2d = self._world_to_screen([ox, oy, oz], mvp, W, H)
+            center_2d = self._world_to_screen([self._selected_obj.pos_x, self._selected_obj.pos_y, self._selected_obj.pos_z], mvp, W, H)
             if center_2d:
                 dist_to_center = math.hypot(mx - center_2d[0], my - center_2d[1])
                 if dist_to_center < 18.0:  # pixel radius for center box
                     return 'free'
+
 
         # Line-segment hit test for translate/scale/etc.
         endpoints = self._gizmo_axis_endpoints()
@@ -1230,7 +1897,8 @@ class GL3DPreview(QOpenGLWidget):
 
     def _gizmo_ring_hit_test(self, mx, my, mvp, W, H):
         """Hit-test the rotation gizmo rings (circles in YZ, XZ, XY planes)."""
-        ox, oy, oz = self._obj_offset
+        if not self._selected_obj: return None
+        ox, oy, oz = self._selected_obj.pos_x, self._selected_obj.pos_y, self._selected_obj.pos_z
         radius = 0.6  # must match _gizmo_rotate_verts
         segments = 64
         threshold = 12.0  # pixels
@@ -1370,6 +2038,47 @@ class GL3DPreview(QOpenGLWidget):
             self._obj_rotation[idx] = self._gizmo_drag_start_angle + angle
 
 
+    def _on_gizmo_drag(self, dx, dy):
+        axis = self._gizmo_active_axis
+        if not axis or not self._selected_obj:
+            return
+
+        if self._gizmo_mode == 'translate':
+            W, H = self.width(), self.height()
+            aspect = W / max(H, 1)
+            proj = _mat4_perspective(60.0, aspect, 0.1, 500.0)
+            view = _lookat(self._camera_pos(), self._target, self._camera_up())
+            mvp  = self._compute_mvp(proj, view)
+            
+            p0 = self._world_to_screen(self._gizmo_drag_start_offset, mvp, W, H)
+            if not p0: return
+            
+            # Simple projected dragging
+            sens = 0.05
+            if axis == 'x':
+                self._selected_obj.pos_x = self._gizmo_drag_start_offset[0] + dx * sens
+            elif axis == 'y':
+                self._selected_obj.pos_y = self._gizmo_drag_start_offset[1] - dy * sens
+            elif axis == 'z':
+                self._selected_obj.pos_z = self._gizmo_drag_start_offset[2] + dx * sens
+            elif axis == 'free':
+                self._selected_obj.pos_x = self._gizmo_drag_start_offset[0] + dx * sens
+                self._selected_obj.pos_y = self._gizmo_drag_start_offset[1] - dy * sens
+
+        elif self._gizmo_mode == 'scale':
+            s = self._gizmo_drag_start_scale + (dx - dy) * 0.01
+            self._selected_obj.scale = max(0.01, s)
+
+        elif self._gizmo_mode == 'rotate':
+            angle = dx * 0.5
+            # Simplified: rotate around Y for now
+            self._selected_obj.rot_y += angle # simplified for this turn
+        
+        # Notify transform change
+        self.object_moved.emit(self._selected_obj)
+
+
+
     # ── Inertia tick ─────────────────────────────────────────────────────────
 
     def _tick(self):
@@ -1428,6 +2137,75 @@ class GL3DPreview(QOpenGLWidget):
             self._v_elev *= 0.92
             self.update()
 
+        # ── Ocean Physics (Buoyancy & Tilting) ─────────────────────────────
+        if self.cfg and getattr(self.cfg, 'ocean', None) and self.cfg.ocean.enabled:
+            o = self.cfg.ocean
+            # Use same relative time for CPU physics to stay in sync
+            t = (time.time() % 3600.0)
+            for obj in self.cfg.scene_objects:
+                if getattr(obj, 'floating', False) and getattr(obj, 'visible', False):
+                    try:
+                        px = getattr(obj, 'pos_x', 0.0)
+                        pz = getattr(obj, 'pos_z', 0.0)
+                        
+                        # Get wave height for bobbing
+                        bob_intensity = getattr(obj, 'float_bob', 1.0)
+                        h = ocean_physics.get_wave_height(
+                            px, pz, t,
+                            wind_speed=o.wind_speed,
+                            wind_direction=o.wind_direction,
+                            choppiness=o.choppiness,
+                            wave_amplitude=o.wave_amplitude,
+                            repetition_size=o.repetition_size,
+                            band0_mul=o.band0_multiplier,
+                            band1_mul=o.band1_multiplier,
+                            chaos=o.chaos,
+                            storm_intensity=o.storm_intensity
+                        ) * bob_intensity
+                        
+                        target_y = o.level + h + getattr(obj, 'buoyancy_offset', 0.0)
+                        
+                        # Smooth bobbing
+                        alpha = o.buoyancy * 0.15
+                        obj.pos_y = obj.pos_y * (1.0 - alpha) + target_y * alpha
+
+                        # Get surface normal for tilting
+                        n = ocean_physics.get_surface_normal(
+                            px, pz, t,
+                            wind_speed=o.wind_speed,
+                            wind_direction=o.wind_direction,
+                            choppiness=o.choppiness,
+                            wave_amplitude=o.wave_amplitude,
+                            repetition_size=o.repetition_size,
+                            band0_mul=o.band0_multiplier,
+                            band1_mul=o.band1_multiplier
+                        )
+                        
+                        # Apply tilt multiplier by lerping normal towards UP
+                        tilt_strength = getattr(obj, 'float_tilt', 1.0)
+                        # n starts as [nx, ny, nz]. We want to blend towards [0, 1, 0]
+                        nx = n[0] * tilt_strength
+                        ny = n[1] # Keep ny or boost it? Keep simple for now.
+                        nz = n[2] * tilt_strength
+                        # Re-normalize isn't strictly needed for atan2 but helps consistency
+                        
+                        # Set Pitch & Roll based on (potentially flattened) normal
+                        obj.rot_x = math.degrees(math.atan2(nz, ny))
+                        obj.rot_z = math.degrees(math.atan2(-nx, ny))
+                        
+                    except Exception as e:
+                        print(f"[Physics] Buoyancy error: {e}")
+            
+            # Continuous update for waves
+            self.update()
+        
+        # --- Weather Auto-refresh ---
+        # Ensure rain/snow falls even if ocean is off and camera is static.
+        if self.cfg and self.cfg.weather:
+            wt = self.cfg.weather.type
+            if wt in ["rain", "stormy", "snow"]:
+                self.update()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # Keep the transparent overlay geometry in sync with our size
@@ -1443,16 +2221,22 @@ class GL3DPreview(QOpenGLWidget):
             # ── Permanent GL state (set once) ───────────────────────────
             glEnable(GL_DEPTH_TEST)
             glDepthFunc(GL_LESS)
+            glDisable(GL_CULL_FACE)
             glClearColor(0.05, 0.07, 0.09, 1.0)
 
             # ── One-time GPU resource creation ──────────────────────────
             self._build_pbr_program()
             self._build_sky_program()
             self._build_gizmo_program()
+            self._build_ocean_program()
+            self._build_weather_program()
+            self._build_pp_program()
             self._upload_sphere()
             self._upload_skybox()
             self._upload_grid()
             self._upload_gizmo()
+            self._upload_ocean()
+            self._upload_weather()
             
             # Clear any errors during init
             while glGetError() != GL_NO_ERROR: pass
@@ -1467,6 +2251,10 @@ class GL3DPreview(QOpenGLWidget):
         except Exception as e:
             print(f"[GL] initializeGL error: {e}")
             self._gl_ready = False
+
+    def resizeGL(self, w, h):
+        if not self._gl_ready: return
+        self._setup_pp_fbo(w, h)
 
     def paintGL(self):
         if not HAS_OPENGL or not self._gl_ready:
@@ -1483,22 +2271,109 @@ class GL3DPreview(QOpenGLWidget):
                 self._load_env_texture()
                 self._env_needs_reload = False
 
-            if self._mesh_needs_upload and self._pending_mesh_path:
-                try:
-                    self._do_upload_mesh(self._pending_mesh_path)
-                except Exception as exc:
-                    print(f"[GL] Mesh upload failed: {exc}")
-                self._pending_mesh_path = ""
+            if self._mesh_needs_upload and self._pending_uploads:
+                to_upload = list(self._pending_uploads)
+                self._pending_uploads.clear()
+                for path in to_upload:
+                    try:
+                        self._do_upload_mesh(path)
+                    except Exception as exc:
+                        print(f"[GL] Mesh upload failed for {path}: {exc}")
                 self._mesh_needs_upload = False
 
             # ── Pure rendering ────────────────────────────────────
             W, H = self.width(), self.height()
-            glDisable(GL_SCISSOR_TEST) # Safeguard against orientation gizmo state leakage
-            glClearColor(0.22, 0.22, 0.22, 1.0)  # Dark Unity-style background
+
+            # --- Reset GL State ...
+            glDisable(GL_SCISSOR_TEST) 
+            glEnable(GL_DEPTH_TEST)
+            glDepthFunc(GL_LESS)
+            glDisable(GL_CULL_FACE)
+            glDisable(GL_BLEND)
+            
+            # ── Capture to FBO ────────────────────────────────────
+            use_fbo = False
+            if self._gl_ready:
+                fe_requested = self.cfg.post_process.fisheye_enabled if (self.cfg and self.cfg.post_process) else False
+                
+                # Try FBO if requested or if we already have it
+                if fe_requested or (self._pp_fbo and glIsFramebuffer(self._pp_fbo)):
+                    if not self._pp_fbo or not glIsFramebuffer(self._pp_fbo):
+                        self._setup_pp_fbo(W, H)
+                    
+                    if self._pp_fbo and glIsFramebuffer(self._pp_fbo):
+                        glBindFramebuffer(GL_FRAMEBUFFER, self._pp_fbo)
+                        use_fbo = True
+                
+                if not use_fbo:
+                    glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
+            
+            glClearColor(0.22, 0.22, 0.22, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+            # ── Pure rendering ────────────────────────────────────
+            W, H = self.width(), self.height()
+            
+            # --- Lightning / Thunder logic ---
+            t_now = time.time()
+            thunder_flash = 0.0
+            if self.cfg and self.cfg.weather and self.cfg.weather.type == "stormy":
+                # Random flash every 3-10 seconds
+                if not hasattr(self, '_next_thunder'): self._next_thunder = t_now + 2.0
+                if not hasattr(self, '_thunder_end'): self._thunder_end = 0.0
+                
+                if t_now > self._next_thunder:
+                    import random
+                    dur = random.uniform(0.1, 0.4)
+                    self._thunder_end = t_now + dur
+                    self._next_thunder = t_now + random.uniform(3.0, 10.0)
+                
+                if t_now < self._thunder_end:
+                    # Pulsing flash effect
+                    thunder_flash = math.sin((self._thunder_end - t_now) * 20.0) * 0.5 + 0.5
+                    thunder_flash *= self.cfg.weather.intensity
+
+            # Compute weather-based lighting
+            def _pmix(a, b, t): return a * (1.0 - t) + b * t
+            base_light = 3.5
+            if self.cfg and self.cfg.weather:
+                wt = self.cfg.weather.type
+                wi = self.cfg.weather.intensity
+                if wt == "cloudy": base_light *= _pmix(1.0, 0.6, wi)
+                elif wt == "rain": base_light *= _pmix(1.0, 0.4, wi)
+                elif wt == "stormy": base_light *= _pmix(1.0, 0.2, wi)
+                elif wt == "snow": base_light *= _pmix(1.0, 0.8, wi)
+                elif wt == "foggy": base_light *= _pmix(1.0, 0.5, wi)
+            
+            # Add lightning flash to base light
+            base_light += thunder_flash * 6.0
+            
+            # --- Reset GL State ...
+            glDisable(GL_SCISSOR_TEST) 
+            glEnable(GL_DEPTH_TEST)
+            glDepthFunc(GL_LESS)
+            glDisable(GL_CULL_FACE)
+            glDisable(GL_BLEND)
+            glClearColor(0.22, 0.22, 0.22, 1.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             
             aspect = W / max(H, 1)
-            proj   = _mat4_perspective(60.0, aspect, 0.1, 5000.0)
+            # Base FOV from config
+            base_fov = self.cfg.fov_y if (self.cfg and hasattr(self.cfg, 'fov_y')) else 60.0
+            
+            # If fisheye is enabled, we MUST render a wider field of view into the FBO
+            # so that the distortion shader has more content to "wrap" in.
+            fe_active = self.cfg.post_process.fisheye_enabled if (self.cfg and self.cfg.post_process) else False
+            fe_strength = self.cfg.post_process.fisheye_strength if (self.cfg and self.cfg.post_process) else 0.5
+            
+            fov = base_fov
+            if fe_active:
+                # Boost FOV significantly for the fisheye capture (e.g. up to 140 degrees)
+                fov = base_fov + (140.0 - base_fov) * fe_strength
+                fov = min(fov, 170.0) # Cap at 170 to avoid extreme inversion artifacts
+                
+            # --- View matrices ---
+            proj   = _mat4_perspective(fov, aspect, 0.1, 5000.0)
             eye    = self._camera_pos()
             up     = self._camera_up()
             view   = _lookat(eye, self._target, up)
@@ -1535,75 +2410,180 @@ class GL3DPreview(QOpenGLWidget):
                     self._set_mat4(sky_prog, "uProj",    proj)
                     self._set_f   (sky_prog, "uEnvStrength",  self._env_strength)
                     self._set_f   (sky_prog, "uHdriRotation", math.radians(self._hdri_rotation))
+                    
+                    # --- Weather Uniforms for Sky ---
+                    if self.cfg and self.cfg.weather:
+                        w = self.cfg.weather
+                        w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
+                        self._set_i(sky_prog, "uWeatherType", w_types.get(w.type, 0))
+                        self._set_f(sky_prog, "uWeatherIntensity", w.intensity)
+                        self._set_f(sky_prog, "uThunderFlash", thunder_flash)
                     try:
                         glActiveTexture(GL_TEXTURE0)
                         glBindTexture(GL_TEXTURE_2D, int(env_tex))
                         self._set_i(sky_prog, "uEnvMap", 0)
-                        while glGetError() != GL_NO_ERROR: pass
                         glBindVertexArray(v_id)
                         glDrawElements(GL_TRIANGLES, self._sky_idx_count, GL_UNSIGNED_INT, None)
                     except Exception as e:
-                        print(f"[GL] Skybox draw error: {e}")
-                    finally:
-                        glBindVertexArray(0)
-                        sky_prog.release()
-                        glDepthMask(GL_TRUE)
-                        glDepthFunc(GL_LESS)
+                        print(f"[GL] Skybox render error: {e}")
+                    sky_prog.release()
 
             # ── Grid floor ─────────────────────────────────────────────────────
             if getattr(self, '_gizmo_prog', None) is not None:
-                self._draw_grid_floor(proj, view)
+                # Hide the floor grid when ocean is on to avoid Z-fighting/grid artifacts
+                if not (self.cfg and self.cfg.ocean.enabled):
+                    self._draw_grid_floor(proj, view)
 
-            # ── PBR mesh ──────────────────────────────────────────────────────
-            if pbr_prog is not None and mesh_vao is not None:
-                v_id = int(mesh_vao)
-                if is_valid_vao(v_id):
-                    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE if self._wireframe else GL_FILL)
-                    pbr_prog.bind()
-                    s  = self._obj_scale
-                    ox, oy, oz = self._obj_offset
-                    rx, ry, rz = self._obj_rotation
-                    model = _mat4_translate(ox, oy, oz)
-                    model = _mat4_mul(model, _mat4_rot_z(rz))
-                    model = _mat4_mul(model, _mat4_rot_y(ry))
-                    model = _mat4_mul(model, _mat4_rot_x(rx))
-                    model = _mat4_mul(model, _mat4_scale(s))
-                    normal_m = _mat3_inverse_transpose(model)
-                    laz, lel = math.radians(self._light_azim), math.radians(self._light_elev)
-                    lx, ly, lz = math.cos(lel)*math.sin(laz), math.sin(lel), math.cos(lel)*math.cos(laz)
-                    self._set_mat4(pbr_prog, "uModel",     model)
-                    self._set_mat4(pbr_prog, "uView",      view)
-                    self._set_mat4(pbr_prog, "uProj",      proj)
-                    self._set_mat3(pbr_prog, "uNormalMat", normal_m)
-                    self._set_v3  (pbr_prog, "uCamPos",    eye[0], eye[1], eye[2])
-                    self._set_v3  (pbr_prog, "uAlbedo",    self._albedo[0], self._albedo[1], self._albedo[2])
-                    self._set_f   (pbr_prog, "uMetallic",      self._metallic)
-                    self._set_f   (pbr_prog, "uRoughness",     self._roughness)
-                    self._set_f   (pbr_prog, "uEnvStrength",   self._env_strength)
-                    self._set_v3  (pbr_prog, "uLightDir",      lx, ly, lz)
-                    self._set_f   (pbr_prog, "uLightIntensity",self._light_intensity)
-                    if env_tex is not None:
-                        try:
+            # ── PBR scene objects ──────────────────────────────────────────────────
+            if pbr_prog is not None:
+                pbr_prog.bind()
+                glDepthMask(GL_TRUE) # Ensure objects write to depth buffer
+                glEnable(GL_DEPTH_TEST)
+                glDepthFunc(GL_LESS)
+                self._set_v3(pbr_prog, "uCamPos", eye[0], eye[1], eye[2])
+                self._set_f(pbr_prog, "uEnvStrength", self._env_strength)
+                self._set_f(pbr_prog, "uLightIntensity", base_light)
+                self._set_v3(pbr_prog, "uLightDir", 0.3, 0.8, 0.6) # Coming from front-right-top
+
+                # --- Weather Uniforms ---
+                if self.cfg and self.cfg.weather:
+                    w = self.cfg.weather
+                    w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
+                    self._set_i(pbr_prog, "uWeatherType", w_types.get(w.type, 0))
+                    self._set_f(pbr_prog, "uWeatherIntensity", w.intensity)
+                    self._set_f(pbr_prog, "uFogDensity", w.fog_density)
+                else:
+                    self._set_i(pbr_prog, "uWeatherType", 0)
+                    self._set_f(pbr_prog, "uWeatherIntensity", 0.0)
+                    self._set_f(pbr_prog, "uFogDensity", 0.0)
+
+                # Draw each object from the scene configuration
+                for obj in getattr(self, 'cfg', None).scene_objects if getattr(self, 'cfg', None) else []:
+                    if not obj.visible: continue
+
+                    mesh_path = getattr(obj.config, 'mesh_path', '')
+                    if mesh_path and mesh_path not in self._mesh_cache:
+                        # Lazy load new meshes discovered in the scene config
+                        self.load_obj_mesh(mesh_path)
+                        self._mesh_needs_upload = True
+
+                    mesh = self._mesh_cache.get(mesh_path)
+                    v_id = mesh["vao"] if mesh else (int(self._sphere_vao) if self._sphere_vao else 0)
+                    idx_count = mesh["count"] if mesh else self._sphere_idx_count
+                    albedo_tex = mesh["albedo"] if mesh else self._albedo_tex
+
+                    if v_id is not None:
+                        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE if self._wireframe else GL_FILL)
+                        
+                        # Uniforms
+                        # Use a neutral light gray if no albedo provided
+                        self._set_v3(pbr_prog, "uAlbedo", 0.9, 0.9, 0.9)
+                        self._set_f(pbr_prog, "uMetallic", getattr(obj, 'metallic', 0.0))
+                        self._set_f(pbr_prog, "uRoughness", getattr(obj, 'roughness', 0.8))
+
+                        # Textures
+                        # ALWAYS bind env map to Unit 0 for every object
+                        if env_tex is not None:
                             glActiveTexture(GL_TEXTURE0)
                             glBindTexture(GL_TEXTURE_2D, int(env_tex))
                             self._set_i(pbr_prog, "uEnvMap", 0)
-                        except: pass
-                    try:
-                        while glGetError() != GL_NO_ERROR: pass
-                        glBindVertexArray(v_id)
-                        glDrawElements(GL_TRIANGLES, self._sphere_idx_count, GL_UNSIGNED_INT, None)
-                    finally:
-                        glBindVertexArray(0)
-                        pbr_prog.release()
 
-            # ── Transform Gizmo (only when object is selected)
-            if getattr(self, '_gizmo_prog', None) is not None and self._obj_selected:
+                        glActiveTexture(GL_TEXTURE0 + 1) # Unit 1
+                        # Use obj.config.tex_albedo if set, else fallback to mesh default
+                        a_tex = None
+                        if obj.config.tex_albedo:
+                            a_tex = self._get_or_create_texture(obj.config.tex_albedo)
+                        if not a_tex: a_tex = albedo_tex
+                        
+                        if a_tex:
+                            glBindTexture(GL_TEXTURE_2D, a_tex)
+                            self._set_i(pbr_prog, "uAlbedoMap", 1)
+                            self._set_i(pbr_prog, "uHasAlbedoMap", 1)
+                        else:
+                            self._set_i(pbr_prog, "uHasAlbedoMap", 0)
+
+                        # Normal map binding
+                        glActiveTexture(GL_TEXTURE0 + 2) # Unit 2
+                        n_tex = self._get_or_create_texture(obj.config.tex_normal)
+                        if n_tex:
+                            glBindTexture(GL_TEXTURE_2D, n_tex)
+                            self._set_i(pbr_prog, "uNormalMap", 2)
+                            self._set_i(pbr_prog, "uHasNormalMap", 1)
+                        else:
+                            self._set_i(pbr_prog, "uHasNormalMap", 0)
+
+
+                        # Model matrix
+                        model = _mat4_translate(obj.pos_x, obj.pos_y, obj.pos_z)
+                        model = _mat4_mul(model, _mat4_rot_z(obj.rot_z))
+                        model = _mat4_mul(model, _mat4_rot_y(obj.rot_y))
+                        model = _mat4_mul(model, _mat4_rot_x(obj.rot_x))
+                        model = _mat4_mul(model, _mat4_scale(obj.scale))
+                        self._set_mat4(pbr_prog, "uModel", model)
+                        self._set_mat4(pbr_prog, "uView",  view)
+                        self._set_mat4(pbr_prog, "uProj",  proj)
+
+                        normal_m = _mat3_inverse_transpose(model)
+                        self._set_mat3(pbr_prog, "uNormalMat", normal_m)
+
+                        glBindVertexArray(v_id)
+                        glDrawElements(GL_TRIANGLES, idx_count, GL_UNSIGNED_INT, None)
+
+                glBindVertexArray(0)
+                pbr_prog.release()
+
+            # Moved after PBR for correct alpha blending
+            glDepthMask(GL_FALSE) # Don't write depth for the ocean
+            self._draw_ocean(proj, view, eye, base_light)
+            glDepthMask(GL_TRUE)
+            
+            # ── Transform Gizmo (selected object)
+            if getattr(self, '_gizmo_prog', None) is not None and self._selected_obj:
+                # The gizmo needs its own draw logic which I'll update to use _selected_obj
                 self._draw_gizmo(proj, view)
+
+            # ── Weather Overlay (Precipitation) ───────────────────
+            self._draw_weather(W, H, thunder_flash, view)
 
             # ── Orientation Gizmo (LAST — uses QPainter which breaks GL state)
             if getattr(self, '_gizmo_prog', None) is not None:
                 self._draw_orientation_gizmo(proj, view)
 
+            # ── Final Blit with Post-Process ──────────────────────
+            # Bind back to the default FBO of the widget (critical for Qt)
+            target_fbo = self.defaultFramebufferObject()
+            glBindFramebuffer(GL_FRAMEBUFFER, target_fbo)
+            
+            # ONLY clear if we are about to blit from an offscreen FBO
+            if use_fbo:
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            
+            if self._pp_prog and self._weather_vao and self._pp_tex:
+                glDisable(GL_DEPTH_TEST)
+                self._pp_prog.bind()
+                glActiveTexture(GL_TEXTURE0)
+                glBindTexture(GL_TEXTURE_2D, self._pp_tex)
+                self._set_i(self._pp_prog, "uScreenTex", 0)
+                
+                fe = self.cfg.post_process.fisheye_enabled if (self.cfg and self.cfg.post_process) else False
+                fs = self.cfg.post_process.fisheye_strength if (self.cfg and self.cfg.post_process) else 0.5
+                
+                self._set_i(self._pp_prog, "uFisheyeEnabled", 1 if fe else 0)
+                self._set_f(self._pp_prog, "uFisheyeStrength", fs)
+                self._set_f(self._pp_prog, "uAspect", W / max(H, 1.0))
+                
+                glBindVertexArray(self._weather_vao) # reuse full-screen quad
+                glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
+                glBindVertexArray(0)
+                self._pp_prog.release()
+                glEnable(GL_DEPTH_TEST)
+            else:
+                # If post-process failed, at least we should have something on screen?
+                # Actually, if we bound FBO earlier, the scene is in self._pp_tex.
+                # If blit fails, we might see nothing.
+                if self._pp_tex:
+                    # Try a simple unshaded blit if possible, or just log
+                    pass
 
         except Exception as e:
             print(f"[GL] paintGL crash: {e}")
@@ -1636,6 +2616,76 @@ class GL3DPreview(QOpenGLWidget):
                 return
             print("[GL] Gizmo shader built OK")
             self._gizmo_prog = prog
+
+    def _build_pp_program(self):
+        try:
+            prog = QOpenGLShaderProgram(self)
+            ok1 = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, _PP_VERT)
+            ok2 = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, _PP_FRAG)
+            if not ok1 or not ok2:
+                print(f"[GL] Post-process shader compile failed: {prog.log()}")
+                return
+            
+            if not prog.link():
+                print(f"[GL] Post-process shader link failed: {prog.log()}")
+                return
+                
+            self._pp_prog = prog
+            print("[GL] Post-process program built OK")
+        except Exception as e:
+            print(f"[GL] _build_pp_program error: {e}")
+
+    def _setup_pp_fbo(self, w, h):
+        from OpenGL.GL import (
+            glGenFramebuffers, glBindFramebuffer, glGenTextures, glBindTexture, 
+            GL_TEXTURE_2D, GL_RGB, GL_UNSIGNED_BYTE, GL_LINEAR, glTexParameteri,
+            GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, glFramebufferTexture2D,
+            GL_COLOR_ATTACHMENT0, glGenRenderbuffers, glBindRenderbuffer,
+            glRenderbufferStorage, GL_DEPTH24_STENCIL8, glFramebufferRenderbuffer,
+            GL_DEPTH_STENCIL_ATTACHMENT, GL_FRAMEBUFFER, GL_RENDERBUFFER,
+            glDeleteFramebuffers, glDeleteTextures, glDeleteRenderbuffers, GL_MAX_TEXTURE_SIZE
+        )
+        
+        # Cleanup safely
+        if self._pp_fbo:
+            try:
+                if glIsFramebuffer(self._pp_fbo):
+                    glDeleteFramebuffers(1, [int(self._pp_fbo)])
+            except: pass
+        if self._pp_tex:
+            try:
+                glDeleteTextures(1, [int(self._pp_tex)])
+            except: pass
+        if self._pp_depth:
+            try:
+                if glIsRenderbuffer(self._pp_depth):
+                    glDeleteRenderbuffers(1, [int(self._pp_depth)])
+            except: pass
+
+        self._pp_fbo = int(glGenFramebuffers(1))
+        glBindFramebuffer(GL_FRAMEBUFFER, self._pp_fbo)
+
+        self._pp_tex = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, self._pp_tex)
+        # Use GL_RGBA for better compatibility with different drivers
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self._pp_tex, 0)
+
+        self._pp_depth = int(glGenRenderbuffers(1))
+        glBindRenderbuffer(GL_RENDERBUFFER, self._pp_depth)
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h)
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, self._pp_depth)
+
+        # Check status
+        from OpenGL.GL import glCheckFramebufferStatus, GL_FRAMEBUFFER_COMPLETE
+        status = glCheckFramebufferStatus(GL_FRAMEBUFFER)
+        if status != GL_FRAMEBUFFER_COMPLETE:
+            print(f"[GL] FBO incomplete: {status}")
+            self._pp_fbo = None
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
     def _upload_gizmo(self):
         """Create a simple VAO/VBO for the gizmo axis lines."""
@@ -1718,13 +2768,15 @@ class GL3DPreview(QOpenGLWidget):
 
     def _draw_gizmo(self, proj, view):
         """Draw mode-specific gizmo overlay."""
-        if self._gizmo_mode == 'view':
-            return  # No gizmo in view mode
-
-        import numpy as np
-        ox, oy, oz = self._obj_offset
+        if not self._selected_obj or self._gizmo_prog is None:
+            return
+        
+        ox, oy, oz = self._selected_obj.pos_x, self._selected_obj.pos_y, self._selected_obj.pos_z
 
         # Extract camera right & up from the view matrix (column-major)
+        import math
+        dist = math.sqrt(sum((self._camera_pos()[i]-ox)**2 for i in range(3)))
+        size = 0.5 * (dist / 10.0) # approx Unity behavior
         # view is a 16-element list in column-major order
         # Row 0 of view = right vector, Row 1 = up vector, Row 2 = -forward
         cam_right = [view[0], view[4], view[8]]
@@ -2004,30 +3056,30 @@ class GL3DPreview(QOpenGLWidget):
 
     # ── Billboard triangle helper ──────────────────────────────────────────
     @staticmethod
-    def _billboard_tri(cx, cy, cz, axis_dir, cam_r, cam_u, size, col):
+    def _billboard_tri(cx, cy, cz, axis_dir, cam_r, cam_up, size, col):
         """Create a camera-facing triangle pointing along axis_dir at (cx,cy,cz)."""
         # Compute perpendicular to axis in camera plane
         # Cross axis_dir with cam_forward to get a screen-space perp
         import math
         ax, ay, az = axis_dir
         # Use cam_right and cam_up to build two perp offsets
-        # Project cam_r and cam_u onto the plane perpendicular to axis
+        # Project cam_r and cam_up onto the plane perpendicular to axis
         # Simple approach: just use cam_up and cam_right scaled
         p1 = [cx - cam_r[i]*size + ax*size*1.5 for i in range(3)]
         p2 = [cx + cam_r[i]*size + ax*size*1.5 for i in range(3)]
         p3 = [cx + ax*size*3 for i in range(3)]
         # Better: compute the triangle tip and two base corners
         tip = [cx + ax*size*2.5, cy + ay*size*2.5, cz + az*size*2.5]
-        b1 = [cx - cam_r[0]*size - cam_u[0]*size*0.3,
-              cy - cam_r[1]*size - cam_u[1]*size*0.3,
-              cz - cam_r[2]*size - cam_u[2]*size*0.3]
-        b2 = [cx + cam_r[0]*size + cam_u[0]*size*0.3,
-              cy + cam_r[1]*size + cam_u[1]*size*0.3,
-              cz + cam_r[2]*size + cam_u[2]*size*0.3]
+        b1 = [cx - cam_r[0]*size - cam_up[0]*size*0.3,
+              cy - cam_r[1]*size - cam_up[1]*size*0.3,
+              cz - cam_r[2]*size - cam_up[2]*size*0.3]
+        b2 = [cx + cam_r[0]*size + cam_up[0]*size*0.3,
+              cy + cam_r[1]*size + cam_up[1]*size*0.3,
+              cz + cam_r[2]*size + cam_up[2]*size*0.3]
         return [*b1, *col, *tip, *col, *b2, *col]
 
     # ── Move Gizmo: arrows with camera-facing cone tips ────────────────────
-    def _gizmo_translate_verts(self, ox, oy, oz, cam_r, cam_u):
+    def _gizmo_translate_verts(self, ox, oy, oz, cam_r, cam_up):
         arm, tip = 0.8, 0.08
         rx = self._axis_col('x', [1.0, 0.15, 0.15])
         gx = self._axis_col('y', [0.15, 1.0, 0.15])
@@ -2043,9 +3095,9 @@ class GL3DPreview(QOpenGLWidget):
         # X arrow
         xT = ox + arm
         tris += [
-            xT, oy-cam_u[1]*tip-cam_r[1]*tip, oz-cam_u[2]*tip-cam_r[2]*tip, *rx,
+            xT, oy-cam_up[1]*tip-cam_r[1]*tip, oz-cam_up[2]*tip-cam_r[2]*tip, *rx,
             xT+tip*2, oy, oz, *rx,
-            xT, oy+cam_u[1]*tip+cam_r[1]*tip, oz+cam_u[2]*tip+cam_r[2]*tip, *rx,
+            xT, oy+cam_up[1]*tip+cam_r[1]*tip, oz+cam_up[2]*tip+cam_r[2]*tip, *rx,
         ]
         # Y arrow
         yT = oy + arm
@@ -2057,16 +3109,16 @@ class GL3DPreview(QOpenGLWidget):
         # Z arrow
         zT = oz + arm
         tris += [
-            ox-cam_r[0]*tip, oy-cam_u[1]*tip, zT, *bx,
+            ox-cam_r[0]*tip, oy-cam_up[1]*tip, zT, *bx,
             ox, oy, zT+tip*2, *bx,
-            ox+cam_r[0]*tip, oy+cam_u[1]*tip, zT, *bx,
+            ox+cam_r[0]*tip, oy+cam_up[1]*tip, zT, *bx,
         ]
 
         # Center box (camera-facing quad for free movement)
         bs = 0.07  # box half-size
         wc = [0.9, 0.9, 0.3]  # yellow/white color
         # Two triangles forming a small camera-facing square
-        cr, cu = cam_r, cam_u
+        cr, cu = cam_r, cam_up
         # Corner offsets from center (ox, oy, oz)
         org = [ox, oy, oz]
         c00 = [org[i] - cr[i]*bs - cu[i]*bs for i in range(3)]
@@ -2239,6 +3291,192 @@ class GL3DPreview(QOpenGLWidget):
                 print(f"[GL] PBR Shader Link Error: {prog.log()}")
             self._prog = prog
 
+    def _build_ocean_program(self):
+        prog = QOpenGLShaderProgram(self)
+        if prog:
+            ok_v = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex,   _OCEAN_VERT)
+            ok_f = prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, _OCEAN_FRAG)
+            if not ok_v:
+                print(f"[GL] Ocean VERT compile error:\n{prog.log()}")
+            if not ok_f:
+                print(f"[GL] Ocean FRAG compile error:\n{prog.log()}")
+            if not prog.link():
+                print(f"[GL] Ocean Shader Link Error: {prog.log()}")
+            else:
+                print("[GL] Ocean shader compiled & linked OK")
+            self._ocean_prog = prog
+
+    def _upload_ocean(self):
+        """Build a high-resolution displacement grid for the ocean using NumPy for speed."""
+        if not HAS_OPENGL: return
+        res = 256 # Balanced resolution for performance vs detail
+        size = 500.0 
+        
+        # Create vertex grid (x, y, z, u, v)
+        x = np.linspace(-0.5, 0.5, res + 1, dtype=np.float32) * size
+        z = np.linspace(-0.5, 0.5, res + 1, dtype=np.float32) * size
+        xv, zv = np.meshgrid(x, z)
+        
+        u = np.linspace(0, 1, res + 1, dtype=np.float32)
+        v = np.linspace(0, 1, res + 1, dtype=np.float32)
+        uv, vv = np.meshgrid(u, v)
+        
+        # Pack into [xx, 0, zz, u, v]
+        vertices = np.zeros((res + 1, res + 1, 5), dtype=np.float32)
+        vertices[..., 0] = xv
+        vertices[..., 1] = 0.0
+        vertices[..., 2] = zv
+        vertices[..., 3] = uv
+        vertices[..., 4] = vv
+        
+        # Create indices
+        grid_indices = np.arange((res + 1) * (res + 1), dtype=np.uint32).reshape(res + 1, res + 1)
+        quad_a = grid_indices[:-1, :-1].ravel()
+        quad_b = grid_indices[:-1, 1:].ravel()
+        quad_c = grid_indices[1:, :-1].ravel()
+        quad_d = grid_indices[1:, 1:].ravel()
+        
+        indices = np.stack([quad_a, quad_b, quad_d, quad_a, quad_d, quad_c], axis=-1).ravel()
+        
+        self._ocean_idx_count = len(indices)
+        data = vertices.ravel()
+        idx_data = indices
+
+        self._ocean_vao = int(glGenVertexArrays(1))
+        glBindVertexArray(self._ocean_vao)
+        self._ocean_vbo = int(glGenBuffers(1))
+        glBindBuffer(GL_ARRAY_BUFFER, self._ocean_vbo)
+        glBufferData(GL_ARRAY_BUFFER, data.nbytes, data, GL_STATIC_DRAW)
+        self._ocean_ebo = int(glGenBuffers(1))
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self._ocean_ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx_data.nbytes, idx_data, GL_STATIC_DRAW)
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 20, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 20, ctypes.c_void_p(12))
+        glEnableVertexAttribArray(1)
+        glBindVertexArray(0)
+
+    def _draw_ocean(self, proj, view, eye, base_light):
+        """Render the ocean surface if enabled in SceneConfig."""
+        if not self.cfg or not self.cfg.ocean.enabled:
+            return
+        if not self._ocean_prog or not self._ocean_vao:
+            return
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        
+        # Ensure we don't inherit wireframe mode from the scene objects
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+        
+        self._ocean_prog.bind()
+        self._set_mat4(self._ocean_prog, "uProj", proj)
+        self._set_mat4(self._ocean_prog, "uView", view)
+        
+        # New Unity-style eye/camera handling
+        if isinstance(eye, (list, tuple, np.ndarray)):
+            self._set_v3(self._ocean_prog, "uCamPos", eye[0], eye[1], eye[2])
+        else: # QPointF or alike
+            self._set_v3(self._ocean_prog, "uCamPos", eye.x(), eye.y(), eye.z())
+        
+        o = self.cfg.ocean
+        # Use relative time (modulo) to maintain floating point precision in shaders.
+        # time.time() is too large (~1.7B) and causes jitter/flatness in GLSL.
+        rel_time = time.time() % 3600.0
+        self._set_f(self._ocean_prog, "uTime",          rel_time * o.time_multiplier)
+        self._set_f(self._ocean_prog, "uRepetitionSize", o.repetition_size)
+        self._set_f(self._ocean_prog, "uLevel",         o.level)
+        self._set_f(self._ocean_prog, "uWindSpeed",     o.wind_speed)
+        self._set_f(self._ocean_prog, "uWindDirection", o.wind_direction)
+        self._set_f(self._ocean_prog, "uChoppiness",    o.choppiness)
+        self._set_f(self._ocean_prog, "uChaos",         o.chaos)
+        self._set_f(self._ocean_prog, "uWaveAmplitude",  o.wave_amplitude)
+        
+        self._set_f(self._ocean_prog, "uBand0Multiplier", o.band0_multiplier)
+        self._set_f(self._ocean_prog, "uBand1Multiplier", o.band1_multiplier)
+        
+        # Currents
+        self._set_f(self._ocean_prog, "uCurrentSpeed",       o.current_speed)
+        self._set_f(self._ocean_prog, "uCurrentOrientation", o.current_orientation)
+        
+        # Ripples
+        self._set_i(self._ocean_prog, "uRipplesEnabled",   1 if o.ripples_enabled else 0)
+        self._set_f(self._ocean_prog, "uRipplesWindSpeed", o.ripples_wind_speed)
+        self._set_f(self._ocean_prog, "uRipplesWindDir",   o.ripples_wind_dir)
+        self._set_f(self._ocean_prog, "uRipplesChaos",     o.ripples_chaos)
+
+        # Colors & Material
+        self._set_v3(self._ocean_prog, "uRefractionColor", o.refraction_color[0], o.refraction_color[1], o.refraction_color[2])
+        self._set_v3(self._ocean_prog, "uScatteringColor", o.scattering_color[0], o.scattering_color[1], o.scattering_color[2])
+        self._set_f(self._ocean_prog,  "uAbsorptionDistance", o.absorption_distance)
+        self._set_f(self._ocean_prog,  "uAmbientScattering",  o.ambient_scattering)
+        self._set_f(self._ocean_prog,  "uHeightScattering",   o.height_scattering)
+        self._set_f(self._ocean_prog,  "uDisplacementScattering", o.displacement_scattering)
+        self._set_f(self._ocean_prog,  "uDirectLightTipScattering", o.direct_light_tip_scattering)
+        self._set_f(self._ocean_prog,  "uDirectLightBodyScattering", o.direct_light_body_scattering)
+        
+        self._set_f(self._ocean_prog,  "uSmoothness",         o.smoothness)
+        self._set_f(self._ocean_prog,  "uTransparency",       o.transparency)
+        self._set_f(self._ocean_prog,  "uEnvStrength",        o.reflection)
+        
+        # Caustics
+        self._set_i(self._ocean_prog, "uCausticsEnabled",   1 if o.caustics_enabled else 0)
+        self._set_f(self._ocean_prog, "uCausticsIntensity", o.caustics_intensity)
+        
+        # Foam
+        self._set_i(self._ocean_prog, "uFoamEnabled", 1 if o.foam_enabled else 0)
+        self._set_f(self._ocean_prog, "uFoamAmount",  o.foam_amount)
+
+        # --- Weather Uniforms ---
+        if self.cfg and self.cfg.weather:
+            w = self.cfg.weather
+            w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
+            self._set_i(self._ocean_prog, "uWeatherType", w_types.get(w.type, 0))
+            self._set_f(self._ocean_prog, "uWeatherIntensity", w.intensity)
+            self._set_f(self._ocean_prog, "uFogDensity", w.fog_density)
+            
+            # Boost uStorm if weather is stormy
+            if w.type == "stormy":
+                self._set_f(self._ocean_prog, "uStorm", max(o.storm_intensity, w.intensity))
+
+        # Sun / directional light (matches the PBR scene light)
+        self._set_v3(self._ocean_prog, "uLightDir", 0.3, 0.8, 0.6)
+        self._set_f(self._ocean_prog, "uLightIntensity", base_light)
+        
+        # Always bind a valid texture to unit 0 — Core Profile makes sampling
+        # from an unbound sampler undefined.  We keep a 1x1 black stub texture
+        # for exactly this case and swap in the real HDRI if one is loaded.
+        glActiveTexture(GL_TEXTURE0)
+        env_tex = getattr(self, '_env_tex', None)
+        # Use real HDRI if path is set, otherwise use procedural sky fallback
+        if env_tex and self._hdri_path:
+            glBindTexture(GL_TEXTURE_2D, int(env_tex))
+            self._set_i(self._ocean_prog, "uHasEnvMap", 1)
+        else:
+            # Procedural fallback is better than sampling a 1x1 black stub
+            if env_tex: glBindTexture(GL_TEXTURE_2D, int(env_tex))
+            self._set_i(self._ocean_prog, "uHasEnvMap", 0)
+            # Create a reusable stub if we don't have one yet
+            stub = getattr(self, '_stub_env_tex', None)
+            if stub is None:
+                stub = int(glGenTextures(1))
+                glBindTexture(GL_TEXTURE_2D, stub)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0,
+                             GL_RGB, GL_UNSIGNED_BYTE, b'\x00\x00\x00')
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                self._stub_env_tex = stub
+            glBindTexture(GL_TEXTURE_2D, stub)
+            self._set_i(self._ocean_prog, "uHasEnvMap", 0)
+        self._set_i(self._ocean_prog, "uEnvMap", 0)
+
+        glBindVertexArray(self._ocean_vao)
+        glDrawElements(GL_TRIANGLES, self._ocean_idx_count, GL_UNSIGNED_INT, None)
+        glBindVertexArray(0)
+        self._ocean_prog.release()
+        glDisable(GL_BLEND)
+
     def _build_sky_program(self):
         prog = QOpenGLShaderProgram(self)
         if prog is not None:
@@ -2247,6 +3485,84 @@ class GL3DPreview(QOpenGLWidget):
             if not prog.link():
                 print(f"[GL] Sky Shader Link Error: {prog.log()}")
             self._sky_prog = prog
+
+    def _build_weather_program(self):
+        prog = QOpenGLShaderProgram(self)
+        if prog:
+            prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex,   _WEATHER_VERT)
+            prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, _WEATHER_FRAG)
+            if not prog.link():
+                print(f"[GL] Weather Shader Link Error: {prog.log()}")
+            self._weather_prog = prog
+
+    def _upload_weather(self):
+        if not HAS_OPENGL: return
+        self._weather_vao = int(glGenVertexArrays(1))
+        glBindVertexArray(self._weather_vao)
+        
+        # Simple fullscreen quad
+        verts = np.array([
+            -1, -1, 0,
+             1, -1, 0,
+             1,  1, 0,
+            -1,  1, 0
+        ], dtype=np.float32)
+        
+        vbo = int(glGenBuffers(1))
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, verts.nbytes, verts, GL_STATIC_DRAW)
+        
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+        
+        indices = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint32)
+        ebo = int(glGenBuffers(1))
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+        
+        glBindVertexArray(0)
+        self._weather_vbo = vbo
+        self._weather_ebo = ebo
+
+    def _draw_weather(self, W, H, thunder_flash, view_mat):
+        if not self.cfg or not self.cfg.weather: return
+        w = self.cfg.weather
+        wt = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}.get(w.type, 0)
+        
+        if wt not in [2, 3, 4] or not getattr(self, '_weather_prog', None): return
+        
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_DEPTH_TEST)
+        
+        self._weather_prog.bind()
+        self._set_f(self._weather_prog, "uTime", time.time() % 1000.0)
+        self._set_i(self._weather_prog, "uWeatherType", wt)
+        self._set_f(self._weather_prog, "uWeatherIntensity", w.intensity)
+        self._set_f(self._weather_prog, "uAspect", W / max(H, 1.0))
+        self._set_f(self._weather_prog, "uThunderFlash", thunder_flash)
+
+        # Extract camera axes directly from View Matrix for stability
+        # View Matrix (Column Major): [ R.x, U.x, -F.x, 0,  R.y, U.y, -F.y, 0, ... ]
+        # In Row-Major/List format: 
+        # m[0,4,8] = Right, m[1,5,9] = Up, m[2,6,10] = -Forward
+        m = view_mat
+        right = [m[0], m[4], m[8]]
+        up    = [m[1], m[5], m[9]]
+        fwd   = [-m[2], -m[6], -m[10]]
+        
+        eye = self._camera_pos()
+        self._set_v3(self._weather_prog, "uCamPos",   eye[0],   eye[1],   eye[2])
+        self._set_v3(self._weather_prog, "uCamRight", right[0], right[1], right[2])
+        self._set_v3(self._weather_prog, "uCamUp",    up[0],    up[1],    up[2])
+        self._set_v3(self._weather_prog, "uCamFwd",   fwd[0],   fwd[1],   fwd[2])
+        
+        glBindVertexArray(self._weather_vao)
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
+        glBindVertexArray(0)
+        self._weather_prog.release()
+        
+        glEnable(GL_DEPTH_TEST)
 
     def _upload_sphere(self):
         if not HAS_OPENGL:
@@ -2322,37 +3638,78 @@ class GL3DPreview(QOpenGLWidget):
         glEnableVertexAttribArray(0)
         glBindVertexArray(0)
 
-    def _upload_custom_mesh(self, verts, faces, normals=None):
-        """Upload custom mesh data into interleaved VBO."""
+    def _upload_custom_mesh(self, verts, faces, normals=None, uvs=None, albedo_path=""):
+        """Upload custom mesh data into interleaved VBO and bind albedo texture if provided."""
         if not HAS_OPENGL or not self._gl_ready:
             return
         import numpy as np
+        from OpenGL.GL import (
+            glGenTextures, glBindTexture, glTexImage2D, glTexParameteri,
+            glGenerateMipmap, GL_TEXTURE_2D, GL_RGB, GL_UNSIGNED_BYTE,
+            GL_LINEAR, GL_CLAMP_TO_EDGE, glActiveTexture, GL_TEXTURE0,
+            glIsVertexArray, glVertexAttribPointer, glEnableVertexAttribArray,
+            GL_FLOAT,
+        )
+        from PySide6.QtGui import QImage
 
-        # Interleaved [pos(3), norm(3), uv(2)] — default to zero for normals/uvs if missing
+        # Interleaved layout: [pos(3), norm(3), uv(2)] per vertex
         num_v = len(verts)
         data = np.zeros((num_v, 8), dtype=np.float32)
         data[:, 0:3] = verts
         if normals is not None and len(normals) == num_v:
             data[:, 3:6] = normals
         else:
-            # Simple fallback normal (up)
-            data[:, 4] = 1.0
+            data[:, 4] = 1.0  # fallback up-normal
+        if uvs is not None and len(uvs) == num_v:
+            data[:, 6:8] = uvs
 
-        self._sphere_idx_count = len(faces.flatten())
-        idx_data = faces.astype(np.uint32).flatten()
+        flat_data = np.ascontiguousarray(data)
+        self._sphere_idx_count = faces.size
+        idx_data = np.ascontiguousarray(faces.astype(np.uint32).flatten())
 
-        from OpenGL.GL import glIsVertexArray
         v_id = int(self._sphere_vao) if self._sphere_vao is not None else -1
+        print(f"[GL] _upload_custom_mesh: vao={v_id} verts={num_v} idxs={self._sphere_idx_count}")
         if v_id >= 0 and glIsVertexArray(v_id):
             glBindVertexArray(v_id)
-            
+
             glBindBuffer(GL_ARRAY_BUFFER, int(self._sphere_vbo))
-            glBufferData(GL_ARRAY_BUFFER, data.nbytes, data, GL_STATIC_DRAW)
-            
+            glBufferData(GL_ARRAY_BUFFER, flat_data.nbytes, flat_data, GL_STATIC_DRAW)
+
+            # Re-declare attribute pointers after each upload
+            stride = 8 * 4  # 8 floats × 4 bytes
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(24))
+            glEnableVertexAttribArray(2)
+
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, int(self._sphere_ebo))
             glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx_data.nbytes, idx_data, GL_STATIC_DRAW)
-            
+
+            # Load albedo texture if path provided
+            if albedo_path and os.path.exists(albedo_path):
+                img = QImage(albedo_path).convertToFormat(QImage.Format.Format_RGB888)
+                w, h = img.width(), img.height()
+                img_data = img.bits().asstring(w * h * 3)
+                tex_id = int(glGenTextures(1))
+                glActiveTexture(GL_TEXTURE0)
+                glBindTexture(GL_TEXTURE_2D, tex_id)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, img_data)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glGenerateMipmap(GL_TEXTURE_2D)
+                self._albedo_tex = tex_id
+                print(f"[GL] Albedo texture loaded ({w}x{h}): {os.path.basename(albedo_path)}")
+            else:
+                self._albedo_tex = None
+
             glBindVertexArray(0)
+            print(f"[GL] _upload_custom_mesh complete")
+        else:
+            print(f"[GL] _upload_custom_mesh SKIPPED — VAO {v_id} not valid")
 
     def _load_env_texture(self):
         """Load equirectangular HDRI .hdr / fallback to placeholder."""
@@ -2845,11 +4202,14 @@ class ViewportWidget(QWidget):
       (camera_changed is kept as legacy for any external listeners)
     """
     camera_changed   = Signal(float, float, float)  # legacy: dist, elev, azim
-    camera_active    = Signal()                      # drag started
-    camera_idle      = Signal(float, float, float)   # camera settled: dist, elev, azim
+    camera_active    = Signal()   # user is dragging/scrolling
+    camera_idle      = Signal(float, float, float)   # user stopped moving for 400ms, carries (dist_world, elev, azim)
     generate_clicked = Signal()
     pause_clicked    = Signal()
     stop_clicked     = Signal()
+    object_selected  = Signal(object) # NEW: 3D pick result
+    object_moved     = Signal(object) # NEW: gizmo result
+    texture_discovered = Signal(str, str) # NEW: mesh_path, texture_path
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2936,7 +4296,7 @@ class ViewportWidget(QWidget):
         tb_layout.addStretch()
         root.addWidget(self.toolbar)
 
-        # ── GL + Inspector in a horizontal split ──────────────────────────────
+        # ── GL + Inspector in a horizontal split ──────────────────────
         self._gl_insp_row = QWidget()
         gi_layout = QHBoxLayout(self._gl_insp_row)
         gi_layout.setContentsMargins(0, 0, 0, 0)
@@ -2944,6 +4304,16 @@ class ViewportWidget(QWidget):
 
         if HAS_OPENGL:
             self._gl = GL3DPreview(self._gl_insp_row)
+            # Stop idle timer before forwarding signal
+            def _on_gl_active():
+                if hasattr(self, '_idle_timer'):
+                    self._idle_timer.stop()
+                self.camera_active.emit()
+            self._gl.camera_active.connect(self.camera_active.emit)
+
+            self._gl.object_selected.connect(self.object_selected.emit)
+            self._gl.object_moved.connect(self.object_moved.emit)
+            self._gl.texture_discovered.connect(self._on_texture_discovered)
             # Scene tool toolbar (left side, Unity-style)
             self._scene_toolbar = SceneToolBar(self._gl_insp_row)
             gi_layout.addWidget(self._scene_toolbar)
@@ -3006,6 +4376,10 @@ class ViewportWidget(QWidget):
             dist_world = self._gl._dist * 200
             self.camera_idle.emit(dist_world, self._gl._elev, self._gl._azim)
 
+    def _on_texture_discovered(self, mesh_path: str, tex_path: str):
+        """Internal: bubble up auto-discovered textures to MainWindow."""
+        self.texture_discovered.emit(mesh_path, tex_path)
+
     # ── Public API (unchanged for MainWindow) ─────────────────────────────────
 
     def set_preview(self, qimage: QImage):
@@ -3033,7 +4407,18 @@ class ViewportWidget(QWidget):
         if self._gl:
             self._gl.set_hdri(path)
 
+    def set_scene_config(self, cfg):
+        """Pass full scene state to the GL widget."""
+        if self._gl:
+            self._gl.set_scene_config(cfg)
+
+    def set_selected_object(self, obj):
+        """Sync selected object with the GL widget."""
+        if self._gl:
+            self._gl.set_selected_object(obj)
+
     def load_mesh(self, path: str):
-        """Forward mesh path to GL widget."""
+        """Forward mesh path to GL widget for caching/loading."""
         if self._gl:
             self._gl.load_obj_mesh(path)
+
