@@ -75,6 +75,7 @@ class ObjectPropertiesPanel(QWidget):
 
         self._tabs.addTab(self._build_material_tab(),  "Material")
         self._tabs.addTab(self._build_transform_tab(), "Transform")
+        self._tabs.addTab(self._build_rand_tab(),      "Randomizers")
 
         self._set_enabled(False)
 
@@ -194,7 +195,12 @@ class ObjectPropertiesPanel(QWidget):
         self._visible_check.setChecked(True)
         self._visible_check.stateChanged.connect(self._on_visibility_changed)
         v_h.addWidget(self._visible_check)
-
+        
+        self._focus_check = QCheckBox("Camera Focus Target")
+        self._focus_check.setToolTip("When Checked, camera will orbit around this object during generation.")
+        self._focus_check.stateChanged.connect(self._on_focus_changed)
+        v_h.addWidget(self._focus_check)
+        
         self._floating_check = QCheckBox("Floating")
         self._floating_check.stateChanged.connect(self._on_floating_changed)
         v_h.addWidget(self._floating_check)
@@ -291,10 +297,55 @@ class ObjectPropertiesPanel(QWidget):
         tab.setStyleSheet("background: #161b27;")
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(12, 12, 12, 12)
-        info = QLabel("Per-object randomizers coming in Phase 3.")
-        info.setStyleSheet("color: #8b949e; font-size: 11px;")
-        info.setWordWrap(True)
+        layout.setSpacing(10)
+
+        info = QLabel("<b>Per-Object Randomizers</b>")
+        info.setStyleSheet("color: #4fc3f7; font-size: 11px;")
         layout.addWidget(info)
+
+        desc = QLabel("These settings control how this specific object varies during generation loop.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #8b949e; font-size: 10px; margin-bottom: 5px;")
+        layout.addWidget(desc)
+
+        # Checkboxes
+        self._rand_pos_chk = QCheckBox("Randomize Position (Jitter)")
+        self._rand_rot_chk = QCheckBox("Randomize Y-Rotation")
+        self._rand_scale_chk = QCheckBox("Randomize Scale (Size)")
+        
+        for chk in [self._rand_pos_chk, self._rand_rot_chk, self._rand_scale_chk]:
+            chk.setStyleSheet("color: #cdd6f4; font-size: 11px;")
+            chk.stateChanged.connect(self._on_rand_changed)
+            layout.addWidget(chk)
+
+        layout.addSpacing(10)
+
+        # Range Sliders (Spinboxes)
+        def _spin_row(label, min_val, max_val, step):
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setStyleSheet("color: #8b949e; font-size: 11px;")
+            row.addWidget(lbl)
+            s = QDoubleSpinBox()
+            s.setRange(min_val, max_val)
+            s.setSingleStep(step)
+            s.setDecimals(2)
+            s.setStyleSheet(
+                "QDoubleSpinBox { background: #1c2333; color: #cdd6f4; border: 1px solid #333; "
+                "border-radius: 3px; padding: 2px 6px; }"
+            )
+            s.valueChanged.connect(self._on_rand_changed)
+            row.addWidget(s)
+            layout.addLayout(row)
+            return s
+
+        self._t_max_spin = _spin_row("Trans Max (px):", 0.0, 50.0, 0.5)
+        self._s_jit_spin = _spin_row("Scale Jitter (%):", 0.0, 1.0, 0.05)
+        
+        layout.addSpacing(5)
+        self._rot_min_spin = _spin_row("Rot Min (Deg):", -360.0, 360.0, 10.0)
+        self._rot_max_spin = _spin_row("Rot Max (Deg):", -360.0, 360.0, 10.0)
+
         layout.addStretch()
         return tab
 
@@ -323,6 +374,7 @@ class ObjectPropertiesPanel(QWidget):
             self._class_combo.setCurrentText(label)
         self._id_label.setText(obj.instance_id)
         self._visible_check.setChecked(obj.visible)
+        self._focus_check.setChecked(getattr(obj, 'is_focus_target', False))
         is_floating = getattr(obj, 'floating', False)
         self._floating_check.setChecked(is_floating)
         self._buoyancy_spin.blockSignals(True)
@@ -361,6 +413,29 @@ class ObjectPropertiesPanel(QWidget):
             sp.setValue(val)
             sp.blockSignals(False)
 
+        # Populate Randomizers tab
+        self._rand_pos_chk.blockSignals(True)
+        self._rand_rot_chk.blockSignals(True)
+        self._rand_scale_chk.blockSignals(True)
+        self._t_max_spin.blockSignals(True)
+        self._s_jit_spin.blockSignals(True)
+        self._rot_min_spin.blockSignals(True)
+        self._rot_max_spin.blockSignals(True)
+
+        self._rand_pos_chk.setChecked(obj.rand_pos)
+        self._rand_rot_chk.setChecked(obj.rand_rot)
+        self._rand_scale_chk.setChecked(obj.rand_scale)
+        self._t_max_spin.setValue(obj.rand_translation_max)
+        self._s_jit_spin.setValue(obj.rand_scale_jitter)
+        self._rot_min_spin.setValue(getattr(obj, 'rand_rot_min', 0.0))
+        self._rot_max_spin.setValue(getattr(obj, 'rand_rot_max', 360.0))
+
+        self._rand_pos_chk.blockSignals(False)
+        self._rand_rot_chk.blockSignals(False)
+        self._rand_scale_chk.blockSignals(False)
+        self._t_max_spin.blockSignals(False)
+        self._s_jit_spin.blockSignals(False)
+
     def _set_enabled(self, v: bool):
         self._tabs.setEnabled(v)
         self._tabs.setStyleSheet(self._tabs.styleSheet())  # force repaint
@@ -384,6 +459,11 @@ class ObjectPropertiesPanel(QWidget):
     def _on_visibility_changed(self, state: int):
         if self._obj:
             self._obj.visible = bool(state)
+
+    def _on_focus_changed(self, state: int):
+        if self._obj:
+            self._obj.is_focus_target = bool(state)
+            self.transform_changed.emit(self._obj) # sync with viewport
 
     def _on_floating_changed(self, state: int):
         if self._obj:
@@ -422,6 +502,17 @@ class ObjectPropertiesPanel(QWidget):
         self._obj.rot_z = self._rz.value()
         self._obj.scale = self._sc.value()
         self.transform_changed.emit(self._obj)
+
+    def _on_rand_changed(self):
+        if self._obj is None:
+            return
+        self._obj.rand_pos = self._rand_pos_chk.isChecked()
+        self._obj.rand_rot = self._rand_rot_chk.isChecked()
+        self._obj.rand_scale = self._rand_scale_chk.isChecked()
+        self._obj.rand_translation_max = self._t_max_spin.value()
+        self._obj.rand_scale_jitter = self._s_jit_spin.value()
+        self._obj.rand_rot_min = self._rot_min_spin.value()
+        self._obj.rand_rot_max = self._rot_max_spin.value()
 
     def _on_apply_all(self):
         """Apply this label to all objects with the same mesh filename."""

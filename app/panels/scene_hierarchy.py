@@ -644,9 +644,13 @@ class SceneHierarchyPanel(QWidget):
         container.add_widget(noise)
 
         # Dataset globals
-        size = CompactSlider("Dataset Resolution", self.cfg.image_size, 128, 1024, 128)
-        size.valueChanged.connect(self._sync_global_res)
-        container.add_widget(size)
+        w_size = CompactSlider("Dataset Width", self.cfg.image_width, 128, 4096, 64)
+        w_size.valueChanged.connect(self._sync_global_width)
+        container.add_widget(w_size)
+
+        h_size = CompactSlider("Dataset Height", self.cfg.image_height, 128, 4096, 64)
+        h_size.valueChanged.connect(self._sync_global_height)
+        container.add_widget(h_size)
         
         self.section_physics.add_widget(container)
 
@@ -725,8 +729,8 @@ class SceneHierarchyPanel(QWidget):
         fe_l.addWidget(self.fe_active)
         container.add_widget(fe_row)
 
-        self.fe_strength = CompactSlider("Distortion", self.cfg.post_process.fisheye_strength, 0.0, 2.0, 0.05)
-        self.fe_strength.valueChanged.connect(lambda v: self._sync_pp_attr('fisheye_strength', v))
+        self.fe_strength = CompactSlider("Distortion", self.cfg.post_process.fisheye_intensity, 0.0, 2.0, 0.05)
+        self.fe_strength.valueChanged.connect(lambda v: self._sync_pp_attr('fisheye_intensity', v))
         container.add_widget(self.fe_strength)
 
         self.section_physics.add_widget(container)
@@ -761,8 +765,12 @@ class SceneHierarchyPanel(QWidget):
         setattr(self.cfg.ocean, attr, val)
         self.scene_changed.emit()
 
-    def _sync_global_res(self, v):
-        self.cfg.image_size = int(v)
+    def _sync_global_width(self, v):
+        self.cfg.image_width = int(v)
+        self.scene_changed.emit()
+
+    def _sync_global_height(self, v):
+        self.cfg.image_height = int(v)
         self.scene_changed.emit()
 
     def _sync_weather_fog(self, v):

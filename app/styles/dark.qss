@@ -219,47 +219,68 @@ QProgressBar::chunk {
 
 /* ── Inputs ─────────────────────────────────────────────────── */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-    background-color: #0d1117;
+    background-color: #161b22;
     border: 1px solid #30363d;
     border-radius: 6px;
-    padding: 5px 8px;
-    color: #cdd6f4;
-    selection-background-color: #4fc3f7;
+    padding: 6px 10px;
+    color: #c9d1d9;
+    font-size: 12px;
+    min-height: 24px;
+}
+
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {
+    border-color: #58a6ff;
+    background-color: #1c2128;
 }
 
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #4fc3f7;
+    background-color: #0d1117;
+    outline: none;
 }
 
 QComboBox {
-    padding-right: 28px;
+    padding-right: 30px;
 }
 
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
-    width: 26px;
+    width: 24px;
     border-left: 1px solid #30363d;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 QComboBox::down-arrow {
-    image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjOGI5NDllIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBvbHlsaW5lIHBvaW50cz0iNiA5IDEyIDE1IDE4IDkiPjwvcG9seWxpbmU+PC9zdmc+");
+    image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiM4Yjk0OWUiIHN0cm9rZS13aWR0aD0iMiIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cGF0aCBkPSJNNiA5bDYgNiA2LTYiLz48L3N2Zz4=");
     width: 14px;
     height: 14px;
 }
 
 QComboBox::down-arrow:on, QComboBox::down-arrow:hover {
-    image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNGZjM2Y3IiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCI+PHBvbHlsaW5lIHBvaW50cz0iNiA5IDEyIDE1IDE4IDkiPjwvcG9seWxpbmU+PC9zdmc+");
+    stroke: #4fc3f7;
 }
 
 QComboBox QAbstractItemView {
-    background-color: #1c2128;
+    background-color: #161b22;
     border: 1px solid #30363d;
     border-radius: 6px;
-    padding: 2px;
     selection-background-color: #1a2744;
-    selection-color: #4fc3f7;
+    selection-color: #58a6ff;
+    padding: 4px;
     outline: none;
+}
+
+QComboBox QAbstractItemView::item {
+    padding: 8px 12px;
+    border-radius: 4px;
+    color: #8b949e;
+}
+
+QComboBox QAbstractItemView::item:selected {
+    background-color: #1a2744;
+    color: #4fc3f7;
 }
 
 /* ── CheckBox / Radio ───────────────────────────────────────── */
@@ -404,14 +425,38 @@ QToolTip {
 
 /* ── Import View ────────────────────────────────────────────── */
 QLabel#view_title {
-    font-size: 24px;
-    font-weight: 300;
-    color: #cdd6f4;
-    letter-spacing: -0.5px;
+    font-size: 28px;
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: -0.8px;
+    margin-bottom: 2px;
 }
 
 QLabel#view_subtitle {
     font-size: 13px;
+    color: #8b949e;
+    margin-bottom: 20px;
+}
+
+QFrame#settings_card {
+    background-color: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+}
+
+QLabel#settings_section_title {
+    font-size: 11px;
+    font-weight: 800;
+    color: #4fc3f7;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-top: 10px;
+    margin-bottom: 5px;
+}
+
+QLabel#property_label {
+    font-size: 12px;
+    font-weight: 500;
     color: #8b949e;
 }
 

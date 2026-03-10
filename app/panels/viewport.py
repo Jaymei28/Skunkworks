@@ -155,15 +155,16 @@ uniform float uEnvStrength;    // HDRI intensity
 uniform vec3  uLightDir;       // sun direction
 
 // --- Weather ---
-uniform int   uWeatherType;      // 0:clear, 1:cloudy, 2:rain, 3:stormy, 4:snow, 5:foggy
+uniform int   uWeatherType;
 uniform float uWeatherIntensity;
 uniform float uFogDensity;
+uniform float uHdriRotation; 
 
 const float PI = 3.14159265359;
 
 // ── Equirectangular env-map sample ──────────────────────────────────────────
 vec3 sampleEnv(vec3 dir, float lod){
-    float phi   = atan(dir.z, dir.x);
+    float phi   = atan(dir.z, dir.x) + uHdriRotation;
     float theta = asin(clamp(dir.y, -1.0, 1.0));
     vec2  uv    = vec2(phi / (2.0*PI) + 0.5, 1.0 - (theta / PI + 0.5));
     return textureLod(uEnvMap, uv, lod).rgb * uEnvStrength;
@@ -339,6 +340,7 @@ uniform float uBand0Multiplier;
 uniform float uBand1Multiplier;
 uniform float uLevel;
 uniform float uStorm;
+uniform float uChaos;
 
 vec4 waves[8] = vec4[](
     vec4(1.0, 0.5,  0.50, 1.2), vec4(0.8, 1.0,  0.45, 0.9), 
@@ -354,27 +356,41 @@ void calculateWave(vec2 basePos, out vec3 displacement, out vec3 tangent, out ve
     height = 0.0;
 
     float windAngle = radians(uWindDirection);
-    mat2 windRot = mat2(cos(windAngle), -sin(windAngle), sin(windAngle), cos(windAngle));
+    float cos_w = cos(windAngle);
+    float sin_w = sin(windAngle);
     
-    float globalAmp = (uWindSpeed / 10.0) * uWaveAmplitude;
-    float globalChop = uChoppiness * 1.8;
+    float storm_boost = 1.0 + uStorm;
+    float global_amp = (uWindSpeed / 10.0) * uWaveAmplitude * storm_boost;
+    float global_chop = uChoppiness * 1.8 * (1.0 + uStorm * 0.5);
 
-    for(int i=0; i<8; i++){
+    for (int i=0; i<8; i++) {
         vec4 w = waves[i];
-        vec2 dir = normalize(windRot * w.xy);
-        float bandMul = (i < 4) ? uBand0Multiplier : uBand1Multiplier;
-        float wavelength = w.w * uRepetitionSize * 0.2;
-        float k = 2.0 * PI / max(wavelength, 0.01);
-        float a = (wavelength / 40.0) * globalAmp * bandMul; 
-        float q = (w.z * globalChop) / (k * a * 8.0 + 0.001);
+        
+        float orig_dx = w.x;
+        float orig_dz = w.y;
+        float dx_rot =  orig_dx * cos_w + orig_dz * sin_w;
+        float dz_rot = -orig_dx * sin_w + orig_dz * cos_w;
+        vec2 dir = normalize(vec2(dx_rot, dz_rot));
+        
+        float band_mul = (i < 4) ? uBand0Multiplier : uBand1Multiplier;
+        float wl = w.w * uRepetitionSize * 0.2;
+        float k = 2.0 * PI / max(wl, 0.01);
+        float a = (wl / 40.0) * global_amp * band_mul;
+        float q = (w.z * global_chop * uChaos) / max(k * a * 8.0, 0.001);
+        
         float speed = sqrt(9.81 / k);
-        float f = k * (dot(dir, basePos) - speed * uTime);
-        float cosF = cos(f); float sinF = sin(f);
-        displacement.x += q * a * dir.x * cosF;
-        displacement.y += a * sinF;
-        displacement.z += q * a * dir.y * cosF;
-        height += a * sinF;
-        float ksc = k * a * cosF; float kss = k * a * sinF;
+        float phase = k * (dot(dir, basePos) - speed * uTime);
+        
+        float cos_p = cos(phase);
+        float sin_p = sin(phase);
+        
+        displacement.x += q * a * dir.x * cos_p;
+        displacement.y += a * sin_p;
+        displacement.z += q * a * dir.y * cos_p;
+        height += a * sin_p;
+
+        float ksc = k * a * cos_p; 
+        float kss = k * a * sin_p;
         tangent  += vec3(-q * dir.x * dir.x * kss, dir.x * ksc, -q * dir.x * dir.y * kss);
         binormal += vec3(-q * dir.x * dir.y * kss, dir.y * ksc, -q * dir.y * dir.y * kss);
     }
@@ -424,6 +440,7 @@ uniform float uEnvStrength;
 uniform vec3  uLightDir;
 uniform float uLightIntensity;
 uniform float uFogDensity;
+uniform float uHdriRotation;
 uniform bool  uRipplesEnabled;
 uniform float uRipplesWindSpeed;
 uniform float uRipplesWindDir;
@@ -482,8 +499,10 @@ void main(){
     vec3 reflection = vec3(0.0);
     vec3 R_vec = reflect(-V, N);
     if (uHasEnvMap) {
-        float p = atan(R_vec.z, R_vec.x); float t = acos(clamp(R_vec.y, -1.0, 1.0));
-        reflection = texture(uEnvMap, vec2(p/(2.0*PI)+0.5, t/PI)).rgb;
+        float p = atan(R_vec.z, R_vec.x) + uHdriRotation; 
+        float t = asin(clamp(R_vec.y, -1.0, 1.0));
+        vec2 uv_reflect = vec2(p/(2.0*PI)+0.5, 1.0 - (t/PI+0.5));
+        reflection = texture(uEnvMap, uv_reflect).rgb;
     } else {
         reflection = mix(vec3(0.2, 0.4, 0.6), vec3(0.7, 0.9, 1.0), pow(clamp(R_vec.y, 0.0, 1.0), 0.5));
     }
@@ -1127,6 +1146,9 @@ class GL3DPreview(QOpenGLWidget):
         # Scene state reference
         self.cfg = None
         self._selected_obj = None
+
+        # Time synchronization for ocean physics
+        self._physics_time = 0.0
 
         # GL objects (initialised in initializeGL)
         self._prog = self._sky_prog = None
@@ -2141,44 +2163,56 @@ class GL3DPreview(QOpenGLWidget):
         if self.cfg and getattr(self.cfg, 'ocean', None) and self.cfg.ocean.enabled:
             o = self.cfg.ocean
             # Use same relative time for CPU physics to stay in sync
-            t = (time.time() % 3600.0)
+            self._physics_time = (time.time() % 3600.0)
+            t = self._physics_time
+            
+            storm_intensity = o.storm_intensity
+            if self.cfg and hasattr(self.cfg, 'weather') and self.cfg.weather and self.cfg.weather.type == "stormy":
+                storm_intensity = max(storm_intensity, self.cfg.weather.intensity)
+                
             for obj in self.cfg.scene_objects:
                 if getattr(obj, 'floating', False) and getattr(obj, 'visible', False):
                     try:
                         px = getattr(obj, 'pos_x', 0.0)
                         pz = getattr(obj, 'pos_z', 0.0)
                         
+                        # Sync with exact logic in renderer (Time * Multiplier)
+                        # This ensure the boat's bobbing matches the visible wave speed
+                        t_physics = t * o.time_multiplier
+                        
                         # Get wave height for bobbing
                         bob_intensity = getattr(obj, 'float_bob', 1.0)
                         h = ocean_physics.get_wave_height(
-                            px, pz, t,
+                            px, pz, t_physics,
                             wind_speed=o.wind_speed,
                             wind_direction=o.wind_direction,
                             choppiness=o.choppiness,
                             wave_amplitude=o.wave_amplitude,
                             repetition_size=o.repetition_size,
-                            band0_mul=o.band0_multiplier,
-                            band1_mul=o.band1_multiplier,
+                            band0_multiplier=o.band0_multiplier,
+                            band1_multiplier=o.band1_multiplier,
                             chaos=o.chaos,
-                            storm_intensity=o.storm_intensity
+                            storm_intensity=storm_intensity
                         ) * bob_intensity
                         
-                        target_y = o.level + h + getattr(obj, 'buoyancy_offset', 0.0)
+                        target_y = o.level + h - getattr(obj, 'buoyancy_offset', 0.0)
                         
-                        # Smooth bobbing
-                        alpha = o.buoyancy * 0.15
+                        # Smooth bobbing (Increased alpha for better responsiveness)
+                        alpha = o.buoyancy * 0.25 # Increased alpha for better responsiveness
                         obj.pos_y = obj.pos_y * (1.0 - alpha) + target_y * alpha
 
                         # Get surface normal for tilting
                         n = ocean_physics.get_surface_normal(
-                            px, pz, t,
+                            px, pz, t_physics,
                             wind_speed=o.wind_speed,
                             wind_direction=o.wind_direction,
                             choppiness=o.choppiness,
                             wave_amplitude=o.wave_amplitude,
                             repetition_size=o.repetition_size,
-                            band0_mul=o.band0_multiplier,
-                            band1_mul=o.band1_multiplier
+                            band0_multiplier=o.band0_multiplier,
+                            band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos,
+                            storm_intensity=storm_intensity
                         )
                         
                         # Apply tilt multiplier by lerping normal towards UP
@@ -2334,19 +2368,7 @@ class GL3DPreview(QOpenGLWidget):
                     thunder_flash *= self.cfg.weather.intensity
 
             # Compute weather-based lighting
-            def _pmix(a, b, t): return a * (1.0 - t) + b * t
-            base_light = 3.5
-            if self.cfg and self.cfg.weather:
-                wt = self.cfg.weather.type
-                wi = self.cfg.weather.intensity
-                if wt == "cloudy": base_light *= _pmix(1.0, 0.6, wi)
-                elif wt == "rain": base_light *= _pmix(1.0, 0.4, wi)
-                elif wt == "stormy": base_light *= _pmix(1.0, 0.2, wi)
-                elif wt == "snow": base_light *= _pmix(1.0, 0.8, wi)
-                elif wt == "foggy": base_light *= _pmix(1.0, 0.5, wi)
-            
-            # Add lightning flash to base light
-            base_light += thunder_flash * 6.0
+            base_light = self._get_active_brightness()
             
             # --- Reset GL State ...
             glDisable(GL_SCISSOR_TEST) 
@@ -2442,8 +2464,9 @@ class GL3DPreview(QOpenGLWidget):
                 glDepthFunc(GL_LESS)
                 self._set_v3(pbr_prog, "uCamPos", eye[0], eye[1], eye[2])
                 self._set_f(pbr_prog, "uEnvStrength", self._env_strength)
+                self._set_f(pbr_prog, "uHdriRotation", math.radians(self._hdri_rotation))
                 self._set_f(pbr_prog, "uLightIntensity", base_light)
-                self._set_v3(pbr_prog, "uLightDir", 0.3, 0.8, 0.6) # Coming from front-right-top
+                self._set_v3(pbr_prog, "uLightDir", 0.3, 0.8, 0.6) 
 
                 # --- Weather Uniforms ---
                 if self.cfg and self.cfg.weather:
@@ -2542,7 +2565,6 @@ class GL3DPreview(QOpenGLWidget):
                 # The gizmo needs its own draw logic which I'll update to use _selected_obj
                 self._draw_gizmo(proj, view)
 
-            # ── Weather Overlay (Precipitation) ───────────────────
             self._draw_weather(W, H, thunder_flash, view)
 
             # ── Orientation Gizmo (LAST — uses QPainter which breaks GL state)
@@ -2593,6 +2615,31 @@ class GL3DPreview(QOpenGLWidget):
             # Ensure viewport is reset to full widget size for any QPainter overlays
             W_phys, H_phys = int(self.width() * self.devicePixelRatio()), int(self.height() * self.devicePixelRatio())
             glViewport(0, 0, W_phys, H_phys)
+
+    def _get_active_brightness(self):
+        """Calculate the final light intensity based on base value, weather, and flash."""
+        def _pmix(a, b, t): return a * (1.0 - t) + b * t
+        brightness = getattr(self, '_light_intensity', 3.5)
+        # Fallback if _light_intensity is not set (e.g. at startup)
+        if brightness < 1.0: brightness = 3.5 
+
+        wt = "clear"
+        if getattr(self, 'cfg', None) and getattr(self.cfg, 'weather', None):
+            wt = self.cfg.weather.type
+            wi = self.cfg.weather.intensity
+            if wt == "cloudy": brightness *= _pmix(1.0, 0.6, wi)
+            elif wt == "rain": brightness *= _pmix(1.0, 0.4, wi)
+            elif wt == "stormy": brightness *= _pmix(1.0, 0.2, wi)
+            elif wt == "snow": brightness *= _pmix(1.0, 0.8, wi)
+            elif wt == "foggy": brightness *= _pmix(1.0, 0.5, wi)
+            
+        # Add transient flash
+        t_now = time.time()
+        if wt == "stormy" and hasattr(self, '_thunder_end') and t_now < self._thunder_end:
+            flash = math.sin((self._thunder_end - t_now) * 20.0) * 0.5 + 0.5
+            brightness += flash * self.cfg.weather.intensity * 6.0
+            
+        return brightness
 
     def _paint_fallback(self):
         """Show PyTorch3D preview image or idle message if no OpenGL."""
@@ -3306,11 +3353,9 @@ class GL3DPreview(QOpenGLWidget):
                 print("[GL] Ocean shader compiled & linked OK")
             self._ocean_prog = prog
 
-    def _upload_ocean(self):
+    def _upload_ocean(self, size=800.0, res=512):
         """Build a high-resolution displacement grid for the ocean using NumPy for speed."""
         if not HAS_OPENGL: return
-        res = 256 # Balanced resolution for performance vs detail
-        size = 500.0 
         
         # Create vertex grid (x, y, z, u, v)
         x = np.linspace(-0.5, 0.5, res + 1, dtype=np.float32) * size
@@ -3382,8 +3427,8 @@ class GL3DPreview(QOpenGLWidget):
         
         o = self.cfg.ocean
         # Use relative time (modulo) to maintain floating point precision in shaders.
-        # time.time() is too large (~1.7B) and causes jitter/flatness in GLSL.
-        rel_time = time.time() % 3600.0
+        # Synchronized with the LAST physics tick time to avoid "flying" boats.
+        rel_time = self._physics_time if self._physics_time > 0 else (time.time() % 3600.0)
         self._set_f(self._ocean_prog, "uTime",          rel_time * o.time_multiplier)
         self._set_f(self._ocean_prog, "uRepetitionSize", o.repetition_size)
         self._set_f(self._ocean_prog, "uLevel",         o.level)
@@ -3419,6 +3464,7 @@ class GL3DPreview(QOpenGLWidget):
         self._set_f(self._ocean_prog,  "uSmoothness",         o.smoothness)
         self._set_f(self._ocean_prog,  "uTransparency",       o.transparency)
         self._set_f(self._ocean_prog,  "uEnvStrength",        o.reflection)
+        self._set_f(self._ocean_prog,  "uHdriRotation",       math.radians(self._hdri_rotation))
         
         # Caustics
         self._set_i(self._ocean_prog, "uCausticsEnabled",   1 if o.caustics_enabled else 0)
@@ -3429,16 +3475,17 @@ class GL3DPreview(QOpenGLWidget):
         self._set_f(self._ocean_prog, "uFoamAmount",  o.foam_amount)
 
         # --- Weather Uniforms ---
+        storm = o.storm_intensity
         if self.cfg and self.cfg.weather:
             w = self.cfg.weather
             w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
             self._set_i(self._ocean_prog, "uWeatherType", w_types.get(w.type, 0))
             self._set_f(self._ocean_prog, "uWeatherIntensity", w.intensity)
             self._set_f(self._ocean_prog, "uFogDensity", w.fog_density)
-            
-            # Boost uStorm if weather is stormy
             if w.type == "stormy":
-                self._set_f(self._ocean_prog, "uStorm", max(o.storm_intensity, w.intensity))
+                storm = max(storm, w.intensity)
+        self._set_f(self._ocean_prog, "uStorm", storm)
+        self._set_f(self._ocean_prog, "uChaos", o.chaos)
 
         # Sun / directional light (matches the PBR scene light)
         self._set_v3(self._ocean_prog, "uLightDir", 0.3, 0.8, 0.6)

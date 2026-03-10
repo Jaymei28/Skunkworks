@@ -48,10 +48,10 @@ from OpenGL.GL import (
     GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER,
     GL_STATIC_DRAW, GL_DYNAMIC_DRAW,
     GL_FLOAT, GL_FALSE, GL_TRUE, GL_TRIANGLES, GL_UNSIGNED_INT,
-    GL_TEXTURE_2D, GL_RGB,
+    GL_TEXTURE_2D, GL_RGB, GL_RGB16F,
     GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
     GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_LINEAR,
-    GL_LINEAR_MIPMAP_LINEAR, GL_CLAMP_TO_EDGE,
+    GL_LINEAR_MIPMAP_LINEAR, GL_CLAMP_TO_EDGE, GL_REPEAT,
     GL_TEXTURE0, GL_TEXTURE1,
     GL_UNSIGNED_BYTE, GL_RGBA,
     GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
@@ -160,26 +160,41 @@ class GLOffscreenRenderer:
         self._ctx.makeCurrent(self._surface)
         try:
             import cv2
-            img = cv2.imread(path, cv2.IMREAD_COLOR | cv2.IMREAD_ANYDEPTH)
+            img = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
             if img is None:
-                return
+                print(f"[GLOffscreen] CV2 failed to load image: {path} - using procedural sky.")
+                # Fallback to procedural sky (match viewport.py)
+                H_fall, W_fall = 256, 512
+                img = np.zeros((H_fall, W_fall, 3), dtype=np.float32)
+                for row in range(H_fall):
+                    t = row / H_fall
+                    img[row, :, 0] = 0.10 + 0.55 * t
+                    img[row, :, 1] = 0.18 + 0.35 * t
+                    img[row, :, 2] = 0.60 - 0.35 * t
+            
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = np.flipud(img)
-            if img.dtype != np.uint8:
-                img = (img * 255).clip(0, 255).astype(np.uint8)
+            if img.ndim == 2: img = np.stack([img]*3, axis=-1)
+            if img.shape[2] > 3: img = img[:, :, :3]
+            img = np.ascontiguousarray(img.astype(np.float32))
             h, w = img.shape[:2]
+            
             if self._env_tex:
-                glDeleteTextures(1, [self._env_tex])
+                try: glDeleteTextures(1, [int(self._env_tex)])
+                except: pass
             self._env_tex = int(glGenTextures(1))
             glBindTexture(GL_TEXTURE_2D, self._env_tex)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0,
-                         GL_RGB, GL_UNSIGNED_BYTE, img.tobytes())
+            
+            # Match viewport.py exactly: float32 data into RGB16F internal
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, w, h, 0,
+                         GL_RGB, GL_FLOAT, img)
+            
             glGenerateMipmap(GL_TEXTURE_2D)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
             glBindTexture(GL_TEXTURE_2D, 0)
+            print(f"[GLOffscreen] HDRI loaded ({w}x{h}): {os.path.basename(path)}")
         except Exception as e:
             print("[GLOffscreen] HDRI load failed:", e)
         finally:
@@ -196,12 +211,8 @@ class GLOffscreenRenderer:
             print("[GLOffscreen] Mesh load failed:", e)
             return
 
-        # Normalize to ~2-unit bounding box
-        verts = lm.vertices.copy()
-        mn, mx = verts.min(axis=0), verts.max(axis=0)
-        verts -= (mn + mx) / 2.0
-        span = float((mx - mn).max()) or 1.0
-        verts *= (2.0 / span)
+        # Normalize exactly as viewport does (scale height to 1.0, center using LoadedMesh stats)
+        verts = (lm.vertices - lm.center) * lm.scale_hint
         local_aabb = (verts.min(axis=0), verts.max(axis=0))
 
         buf = _interleave(verts, lm.normals, lm.uvs)
@@ -240,7 +251,9 @@ class GLOffscreenRenderer:
     # Render
     # ------------------------------------------------------------------
 
-    def render_frame(self, cfg, azim, elev, dist, t=0.0):
+    def render_frame(self, cfg, azim, elev, dist, t=0.0, target=[0.0, 0.0, 0.0],
+                     light_azim=None, light_elev=None, light_intensity=None,
+                     env_strength=None, hdri_rotation=None):
         """
         Render one frame.
         Returns (rgb_np, bboxes) where:
@@ -252,6 +265,7 @@ class GLOffscreenRenderer:
 
         glViewport(0, 0, self.width, self.height)
         glClearColor(0.12, 0.13, 0.15, 1.0)
+        glDepthMask(GL_TRUE) # Must be ON for clear to work
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LESS)
@@ -261,27 +275,52 @@ class GLOffscreenRenderer:
 
         # Camera matrices
         aspect = self.width / max(self.height, 1)
-        fov    = getattr(cfg, 'fov_y', 60.0)
+        base_fov = getattr(cfg, 'fov_y', 60.0)
+        
+        # Support Fisheye FOV boosting if active in config
+        fov = base_fov
+        if cfg and hasattr(cfg, 'post_process'):
+            pp = cfg.post_process
+            if getattr(pp, 'fisheye_enabled', False):
+                strength = getattr(pp, 'fisheye_strength', 0.5)
+                fov = base_fov + (140.0 - base_fov) * strength
+                fov = min(fov, 170.0)
+
         proj   = _mat4_perspective(fov, aspect, 0.1, 5000.0)
 
         r  = math.radians(elev)
         a  = math.radians(azim)
-        ex = dist * math.cos(r) * math.sin(a)
-        ey = dist * math.sin(r)
-        ez = dist * math.cos(r) * math.cos(a)
+        ex = target[0] + dist * math.cos(r) * math.sin(a)
+        ey = target[1] + dist * math.sin(r)
+        ez = target[2] + dist * math.cos(r) * math.cos(a)
         eye = [ex, ey, ez]
-        view = _lookat(eye, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+        view = _lookat(eye, target, [0.0, 1.0, 0.0])
 
         # Sky / HDRI background
         if self._sky_prog and self._sky_vao and self._env_tex:
+            glDisable(GL_CULL_FACE) # Skybox must never be culled
             glDepthMask(GL_FALSE)
+            glDepthFunc(GL_LEQUAL)  # Skybox is at far plane (1.0)
             self._sky_prog.bind()
             vr = list(view)
             vr[12] = vr[13] = vr[14] = 0.0
             self._umat4(self._sky_prog, "uViewRot", vr)
             self._umat4(self._sky_prog, "uProj", proj)
-            self._uf(self._sky_prog, "uEnvStrength", 1.0)
-            self._uf(self._sky_prog, "uHdriRotation", 0.0)
+            
+            # Sync sky settings from config/viewport
+            env_str = env_strength if env_strength is not None else getattr(cfg, 'env_strength', 1.0)
+            hdri_rot = math.radians(hdri_rotation if hdri_rotation is not None else getattr(cfg, 'hdri_rotation', 0.0))
+            self._uf(self._sky_prog, "uEnvStrength", env_str)
+            self._uf(self._sky_prog, "uHdriRotation", hdri_rot)
+            
+            # Weather for sky
+            if hasattr(cfg, 'weather'):
+                w = cfg.weather
+                w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
+                self._ui(self._sky_prog, "uWeatherType", w_types.get(w.type, 0))
+                self._uf(self._sky_prog, "uWeatherIntensity", w.intensity)
+                self._uf(self._sky_prog, "uThunderFlash", 0.0)
+
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, self._env_tex)
             self._ui(self._sky_prog, "uEnvMap", 0)
@@ -290,11 +329,21 @@ class GLOffscreenRenderer:
             glBindVertexArray(0)
             self._sky_prog.release()
             glDepthMask(GL_TRUE)
+            glEnable(GL_CULL_FACE) # Restore for objects
 
         glDepthFunc(GL_LESS)
 
         # PBR meshes
-        sun_dir = [0.3, 0.8, 0.6]
+        # Sync light from parameters or config
+        laz = math.radians(light_azim if light_azim is not None else 45.0)
+        lel = math.radians(light_elev if light_elev is not None else 60.0)
+        sun_dir = [
+            math.cos(lel) * math.sin(laz),
+            math.sin(lel),
+            math.cos(lel) * math.cos(laz)
+        ]
+        brightness = light_intensity if light_intensity is not None else getattr(cfg, 'light_intensity', 2.8)
+        
         bboxes  = []
         if self._pbr_prog:
             self._pbr_prog.bind()
@@ -302,8 +351,18 @@ class GLOffscreenRenderer:
             self._umat4(self._pbr_prog, "uProj", proj)
             self._uv3(self._pbr_prog,  "uCamPos",         *eye)
             self._uv3(self._pbr_prog,  "uLightDir",       *sun_dir)
-            self._uf(self._pbr_prog,   "uLightIntensity", 3.5)
-            self._uf(self._pbr_prog,   "uEnvStrength",    1.0)
+            self._uf(self._pbr_prog,   "uLightIntensity", brightness)
+            self._uf(self._pbr_prog,   "uEnvStrength",    env_str)
+            self._uf(self._pbr_prog,   "uHdriRotation",   hdri_rot)
+
+            # Weather for PBR
+            if hasattr(cfg, 'weather'):
+                w = cfg.weather
+                w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
+                self._ui(self._pbr_prog, "uWeatherType", w_types.get(w.type, 0))
+                self._uf(self._pbr_prog, "uWeatherIntensity", w.intensity)
+                self._uf(self._pbr_prog, "uFogDensity", w.fog_density)
+
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, self._env_tex)
             self._ui(self._pbr_prog, "uEnvMap", 0)
@@ -317,18 +376,14 @@ class GLOffscreenRenderer:
                 gd = self._mesh_gpu[path]
 
                 sc = getattr(obj, 'scale', 1.0)
-                model = _mat4_mul(
-                    _mat4_translate(
-                        getattr(obj, 'pos_x', 0.0),
-                        getattr(obj, 'pos_y', 0.0),
-                        getattr(obj, 'pos_z', 0.0)),
-                    _mat4_mul(
-                        _mat4_rot_y(getattr(obj, 'rot_y', 0.0)),
-                        _mat4_mul(
-                            _mat4_rot_x(getattr(obj, 'rot_x', 0.0)),
-                            _mat4_mul(
-                                _mat4_rot_z(getattr(obj, 'rot_z', 0.0)),
-                                _mat4_scale(sc)))))
+                model = _mat4_translate(
+                    getattr(obj, 'pos_x', 0.0),
+                    getattr(obj, 'pos_y', 0.0),
+                    getattr(obj, 'pos_z', 0.0))
+                model = _mat4_mul(model, _mat4_rot_z(getattr(obj, 'rot_z', 0.0)))
+                model = _mat4_mul(model, _mat4_rot_y(getattr(obj, 'rot_y', 0.0)))
+                model = _mat4_mul(model, _mat4_rot_x(getattr(obj, 'rot_x', 0.0)))
+                model = _mat4_mul(model, _mat4_scale(sc))
                 self._umat4(self._pbr_prog, "uModel", model)
                 nm = _mat3_inverse_transpose(model)
                 glUniformMatrix3fv(
@@ -376,19 +431,56 @@ class GLOffscreenRenderer:
             self._uf(self._ocean_prog,  "uWindDirection",   o.wind_direction)
             self._uf(self._ocean_prog,  "uChoppiness",      o.choppiness)
             self._uf(self._ocean_prog,  "uChaos",           o.chaos)
-            self._uf(self._ocean_prog,  "uStorm",           o.storm_intensity)
+            self._uf(self._ocean_prog,  "uBand0Multiplier", o.band0_multiplier)
+            self._uf(self._ocean_prog,  "uBand1Multiplier", o.band1_multiplier)
+            self._uf(self._ocean_prog,  "uWaveAmplitude",   o.wave_amplitude)
+            self._uf(self._ocean_prog,  "uRepetitionSize",  o.repetition_size)
+            
+            # Storm logic
+            storm = o.storm_intensity
+            if hasattr(cfg, 'weather') and cfg.weather.type == "stormy":
+                storm = max(storm, cfg.weather.intensity)
+            self._uf(self._ocean_prog,  "uStorm",           storm)
+
+            # Currents
+            self._uf(self._ocean_prog,  "uCurrentSpeed",       o.current_speed)
+            self._uf(self._ocean_prog,  "uCurrentOrientation", o.current_orientation)
+
             self._uv3(self._ocean_prog, "uRefractionColor", *o.refraction_color)
             self._uv3(self._ocean_prog, "uScatteringColor", *o.scattering_color)
             self._uf(self._ocean_prog,  "uAbsorptionDistance", o.absorption_distance)
             self._uf(self._ocean_prog,  "uAmbientScattering",  o.ambient_scattering)
             self._uf(self._ocean_prog,  "uHeightScattering",   o.height_scattering)
+            self._uf(self._ocean_prog,  "uDisplacementScattering", o.displacement_scattering)
+            self._uf(self._ocean_prog,  "uDirectLightTipScattering", o.direct_light_tip_scattering)
+            self._uf(self._ocean_prog,  "uDirectLightBodyScattering", o.direct_light_body_scattering)
             self._uf(self._ocean_prog,  "uSmoothness",      o.smoothness)
             self._uf(self._ocean_prog,  "uTransparency",    o.transparency)
             self._uf(self._ocean_prog,  "uEnvStrength",     o.reflection)
+            self._uf(self._ocean_prog,  "uHdriRotation",    hdri_rot)
+
+            # Ripples & Foam
+            self._ui(self._ocean_prog,  "uRipplesEnabled",  1 if o.ripples_enabled else 0)
+            self._uf(self._ocean_prog,  "uRipplesWindSpeed", o.ripples_wind_speed)
+            self._uf(self._ocean_prog,  "uRipplesWindDir",   o.ripples_wind_dir)
+            self._uf(self._ocean_prog,  "uRipplesChaos",     o.ripples_chaos)
+            
+            self._ui(self._ocean_prog,  "uCausticsEnabled",   1 if o.caustics_enabled else 0)
+            self._uf(self._ocean_prog,  "uCausticsIntensity", o.caustics_intensity)
+            
             self._ui(self._ocean_prog,  "uFoamEnabled",     1 if o.foam_enabled else 0)
             self._uf(self._ocean_prog,  "uFoamAmount",      o.foam_amount)
+
+            # Weather for Ocean
+            if hasattr(cfg, 'weather'):
+                w = cfg.weather
+                w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
+                self._ui(self._ocean_prog, "uWeatherType", w_types.get(w.type, 0))
+                self._uf(self._ocean_prog, "uWeatherIntensity", w.intensity)
+                self._uf(self._ocean_prog, "uFogDensity", w.fog_density)
+
             self._uv3(self._ocean_prog, "uLightDir",        *sun_dir)
-            self._uf(self._ocean_prog,  "uLightIntensity",  3.5)
+            self._uf(self._ocean_prog,  "uLightIntensity",  brightness)
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_2D, self._env_tex)
             self._ui(self._ocean_prog, "uEnvMap", 0)
@@ -457,7 +549,7 @@ class GLOffscreenRenderer:
         glEnableVertexAttribArray(0)
         glBindVertexArray(0)
 
-    def _upload_ocean(self, size=250, res=256):
+    def _upload_ocean(self, size=800.0, res=512):
         half = size / 2.0
         step = size / res
         verts, indices = [], []
@@ -517,7 +609,7 @@ class GLOffscreenRenderer:
             if img is None:
                 return None
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = np.flipud(img)
+            # No flipud here
             h, w = img.shape[:2]
             tex = int(glGenTextures(1))
             glBindTexture(GL_TEXTURE_2D, tex)

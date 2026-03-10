@@ -58,6 +58,16 @@ class SceneObject:
     buoyancy_offset: float = 0.0    # Vertical offset for floating objects (waterline adjustment)
     float_bob:  float = 1.0         # Bobbing intensity
     float_tilt: float = 1.0         # Tilting intensity
+    is_focus_target: bool = False   # If true, camera orbits THIS object during generation
+    
+    # Per-Object Randomization
+    rand_pos:   bool = True
+    rand_rot:   bool = True
+    rand_scale: bool = True
+    rand_translation_max: float = 1.0
+    rand_scale_jitter:    float = 0.15
+    rand_rot_min:         float = 0.0
+    rand_rot_max:         float = 360.0
 
     @property
     def display_name(self) -> str:
@@ -99,11 +109,12 @@ class PostProcessConfig:
     noise_max:         float =  0.06
 
     ao_enabled:        bool  = True
-    ao_min:            float =  0.0
-    ao_max:            float =  0.35
-
+    
+    # Fish-eye Distortion
     fisheye_enabled:   bool  = False
-    fisheye_strength:  float = 0.5
+    fisheye_intensity: float = 0.5
+
+    wb_enabled:        bool  = True
 
     wb_enabled:        bool  = True
     wb_temp_min:       float =  3500.0
@@ -179,6 +190,13 @@ class SceneConfig:
     hdri_paths: List[str] = field(default_factory=list)
     output_dir: str = ""
     
+    # ── Randomization Toggles ────────────────────────────────────
+    rand_pose:      bool = True
+    rand_hdri:      bool = True
+    rand_lighting:  bool = True
+    rand_transform: bool = True
+    rand_weather:   bool = True
+    
     # ── Global / HDRI Randomizers ────────────────────────────────
     hdri_randomizers: List[RandomizerInstance] = field(default_factory=list)
 
@@ -191,7 +209,8 @@ class SceneConfig:
 
     # ── Generation ───────────────────────────────────────────────
     num_images:     int   = 500
-    image_size:     int   = 512
+    image_width:    int   = 640
+    image_height:   int   = 480
     num_obj_max:    int   = 3
     bg_only_prob:   float = 0.10
     class_name:     str   = "Object" # Default / global
@@ -202,10 +221,11 @@ class SceneConfig:
     hdri_strength_max: float = 2.5
 
     # ── Camera / Pose ─────────────────────────────────────────────
-    dist_min:  float = 400.0
-    dist_max:  float = 800.0
-    elev_min:  float =   0.0
-    elev_max:  float =  90.0
+    # Standard normalized range (objects are ~2 units large)
+    dist_min:  float =   2.0
+    dist_max:  float =  12.0
+    elev_min:  float =   5.0
+    elev_max:  float =  60.0
     azim_min:  float =   0.0
     azim_max:  float = 360.0
     
@@ -221,7 +241,7 @@ class SceneConfig:
     target_frac_min: float = 0.10
     target_frac_max: float = 0.35
     scale_jitter:    float = 0.15
-    translation_max: float = 50.0
+    translation_max: float = 2.0
 
     # ── Sub-configs ───────────────────────────────────────────────
     weather:      WeatherConfig     = field(default_factory=WeatherConfig)
@@ -231,6 +251,56 @@ class SceneConfig:
     def to_dict(self):
         from dataclasses import asdict
         return asdict(self)
+
+    @staticmethod
+    def from_unity_json(data: dict) -> "SceneConfig":
+        """Maps Unity PascalCase JSON (from JsonUtility) to Python snake_case SceneConfig."""
+        cfg = SceneConfig()
+        
+        # 1. Global Settings
+        cfg.num_images = data.get("numImages", cfg.num_images)
+        cfg.image_width = data.get("imageSize", cfg.image_width)
+        cfg.image_height = data.get("imageSize", cfg.image_height)
+        
+        # 2. Camera Ranges
+        cfg.dist_min = data.get("distMin", cfg.dist_min)
+        cfg.dist_max = data.get("distMax", cfg.dist_max)
+        cfg.elev_min = data.get("elevMin", cfg.elev_min)
+        cfg.elev_max = data.get("elevMax", cfg.elev_max)
+        
+        # 3. Import Scene Objects
+        unity_objs = data.get("sceneObjects", [])
+        cfg.scene_objects = []
+        
+        for uo in unity_objs:
+            obj = SceneObject()
+            obj.instance_id = str(uo.get("instanceId", "obj_" + str(uuid.uuid4())[:4]))
+            obj.label = uo.get("label", "Object")
+            
+            # Position
+            pos = uo.get("position", {"x": 0, "y": 0, "z": 0})
+            obj.pos_x = pos.get("x", 0.0)
+            obj.pos_y = pos.get("y", 0.0)
+            obj.pos_z = pos.get("z", 0.0)
+            
+            # Rotation
+            rot = uo.get("rotation", {"x": 0, "y": 0, "z": 0})
+            obj.rot_x = rot.get("x", 0.0)
+            obj.rot_y = rot.get("y", 0.0)
+            obj.rot_z = rot.get("z", 0.0)
+            
+            # Scale
+            obj.scale = uo.get("scale", 1.0)
+            
+            # PBR
+            obj.metallic = uo.get("metallic", 0.0)
+            obj.roughness = uo.get("roughness", 0.8)
+            obj.floating = uo.get("floating", False)
+            obj.is_focus_target = uo.get("isFocusTarget", False)
+            
+            cfg.scene_objects.append(obj)
+            
+        return cfg
 
     def validate(self) -> list[str]:
         """Return a list of validation error strings (empty = OK)."""

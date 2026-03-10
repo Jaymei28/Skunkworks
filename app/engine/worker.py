@@ -13,6 +13,7 @@ Signals emitted:
 
 import os
 import sys
+import time
 import random as _rng
 random = _rng
 import traceback
@@ -146,7 +147,7 @@ class GeneratorWorker(QThread):
 
         # ---- Renderer ----
         self._log("[Init] Building renderer...")
-        renderer = Renderer3D(image_size=cfg.image_size, device=device)
+        renderer = Renderer3D(image_size=(cfg.image_height, cfg.image_width), device=device)
         renderer.shader.blend_params = BlendParams(background_color=(0.0, 0.0, 0.0))
 
         mask_ann = MaskAnnotator()
@@ -329,7 +330,7 @@ class GeneratorWorker(QThread):
                                          float(r_inst.params.get("translation_max", cfg.translation_max)),
                                     ),
                                     fov_y_deg=float(r_inst.params.get("fov_y", cfg.fov_y)),
-                                    image_size=cfg.image_size,
+                                    image_size=cfg.image_width,
                                 )
                                 m_instance, _ = tfr.apply(m_instance, device=device)
 
@@ -416,9 +417,9 @@ class GeneratorWorker(QThread):
                 bbox    = all_bboxes
 
             else:
-                S       = cfg.image_size
-                raw_rgb = torch.zeros((S, S, 3), device=device)
-                fg      = torch.zeros((S, S), device=device)
+                W, H    = cfg.image_width, cfg.image_height
+                raw_rgb = torch.zeros((H, W, 3), device=device)
+                fg      = torch.zeros((H, W), device=device)
                 bbox    = []
                 cls_list = []
 
@@ -526,12 +527,11 @@ class PreviewWorker(QThread):
         cfg    = self.config
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Render preview at a fixed 512px for maximum responsiveness
-        preview_size = 512
+        # Use a consistent preview size
+        preview_h, preview_w = 480, 640
+        self._log(f"[Preview] Rendering {preview_w}x{preview_h} frame (HD mode) on {device}…")
 
-        self._log(f"[Preview] Rendering {preview_size}px frame (HD mode) on {device}…")
-
-        renderer = Renderer3D(image_size=preview_size, device=device)
+        renderer = Renderer3D(image_size=(preview_h, preview_w), device=device)
         renderer.shader.blend_params = BlendParams(background_color=(0.0, 0.0, 0.0))
 
         # ── Load HDRI ──────────────────────────────────────────────────
@@ -601,7 +601,7 @@ class PreviewWorker(QThread):
                 rotation_range=(0, 360),
                 translation_range=(-10.0, 10.0),
                 fov_y_deg=cfg.fov_y,
-                image_size=preview_size,
+                image_size=640,
             )
             scaled_mesh, _ = transform_rand.apply(base_mesh.clone(), device=device)
         else:
@@ -690,31 +690,93 @@ class GLPreviewWorker(QThread):
     finished      = Signal()
 
     def __init__(self, config, azim: float = 45.0, elev: float = 25.0,
-                 dist: float = 3.0, parent=None):
+                 dist: float = 3.0, target: list[float] = [0.0, 0.0, 0.0],
+                 hdri_path: str = "", env_strength: float = 1.0, 
+                 hdri_rotation: float = 0.0, parent=None):
         super().__init__(parent)
         self.config = config
         self.azim   = azim
         self.elev   = elev
         self.dist   = dist
+        self.target = target
+        self.hdri_path     = hdri_path
+        self.env_strength  = env_strength
+        self.hdri_rotation = hdri_rotation
         # Surface must be created on the main thread
         from app.engine.gl_offscreen_renderer import GLOffscreenRenderer
-        self._renderer = GLOffscreenRenderer(512, 512)
+        w, h = config.image_width, config.image_height
+        self._renderer = GLOffscreenRenderer(w, h)
 
     def run(self):
         try:
+            import time
+            from app.engine.ocean_sim import ocean_physics
+            import math
+
             self._renderer.init_gl()
 
             cfg = self.config
-            if cfg.hdri_paths:
-                self._renderer.load_hdri(cfg.hdri_paths[0])
+            
+            # Load HDRI (Prefer explicit path from viewport, fallback to config list)
+            hdri = self.hdri_path
+            if not hdri and cfg.hdri_paths:
+                hdri = cfg.hdri_paths[0]
+            
+            if hdri:
+                self._renderer.load_hdri(hdri)
 
             for obj in cfg.scene_objects:
                 if obj.config.mesh_path:
                     self._renderer.load_mesh_from_path(
                         obj.config.mesh_path, obj.config.tex_albedo)
 
+            # --- Physics Sync for Preview Frame ---
+            # Match the viewport's exact time logic
+            t = (time.time() % 3600.0)
+            if cfg.ocean.enabled:
+                o = cfg.ocean
+                t_physics = t * o.time_multiplier
+                storm = o.storm_intensity
+                if hasattr(cfg, 'weather') and cfg.weather.type == "stormy":
+                    storm = max(storm, cfg.weather.intensity)
+
+                for obj in cfg.scene_objects:
+                    if getattr(obj, 'floating', False) and getattr(obj, 'visible', False):
+                        px, pz = getattr(obj, 'pos_x', 0.0), getattr(obj, 'pos_z', 0.0)
+                        bob_intensity = getattr(obj, 'float_bob', 1.0)
+                        h = ocean_physics.get_wave_height(
+                            px, pz, t_physics,
+                            wind_speed=o.wind_speed,
+                            wind_direction=o.wind_direction,
+                            choppiness=o.choppiness,
+                            wave_amplitude=o.wave_amplitude,
+                            repetition_size=o.repetition_size,
+                            band0_multiplier=o.band0_multiplier,
+                            band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos,
+                            storm_intensity=storm
+                        ) * bob_intensity
+                        
+                        # Apply submergence offset (positive = deeper)
+                        submergence = getattr(obj, 'buoyancy_offset', 0.0)
+                        obj.pos_y = o.level + h - submergence
+
+                        n = ocean_physics.get_surface_normal(
+                            px, pz, t_physics,
+                            wind_speed=o.wind_speed, wind_direction=o.wind_direction,
+                            choppiness=o.choppiness, wave_amplitude=o.wave_amplitude,
+                            repetition_size=o.repetition_size,
+                            band0_multiplier=o.band0_multiplier, band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos, storm_intensity=storm
+                        )
+                        tilt_strength = getattr(obj, 'float_tilt', 1.0)
+                        nx, ny, nz = n[0] * tilt_strength, n[1], n[2] * tilt_strength
+                        obj.rot_x = math.degrees(math.atan2(nz, ny))
+                        obj.rot_z = math.degrees(math.atan2(-nx, ny))
+
             frame_np, _ = self._renderer.render_frame(
-                cfg, self.azim, self.elev, self.dist, t=0.0)
+                cfg, self.azim, self.elev, self.dist, t=t, target=self.target,
+                env_strength=self.env_strength, hdri_rotation=self.hdri_rotation)
 
             h, w, _ = frame_np.shape
             qi = QImage(frame_np.tobytes(), w, h, w * 3,
@@ -745,12 +807,23 @@ class GLGeneratorWorker(QThread):
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.config  = config
+        self._target = [0.0, 0.0, 0.0]
+        self._azim_override = None
+        self._elev_override = None
+        self._dist_override = None
+        self._light_azim_override = None
+        self._light_elev_override = None
+        self._light_intensity_override = None
+        self._hdri_override = None
+        self._hdri_rotation_override = 0.0
+        self._env_strength_override = 1.0
+        self._time_override = None
         self._stop   = False
         self._paused = False
         # Surface created on main thread
         from app.engine.gl_offscreen_renderer import GLOffscreenRenderer
-        sz = config.image_size
-        self._renderer = GLOffscreenRenderer(sz, sz)
+        w, h = config.image_width, config.image_height
+        self._renderer = GLOffscreenRenderer(w, h)
 
     def stop(self):    self._stop   = True
     def pause(self):   self._paused = True
@@ -784,8 +857,11 @@ class GLGeneratorWorker(QThread):
             os.makedirs(d, exist_ok=True)
 
         # ── Load HDRI ─────────────────────────────────────────────────────────
-        if cfg.hdri_paths:
+        hdri = self._hdri_override
+        if not hdri and cfg.hdri_paths:
             hdri = _rng.choice(cfg.hdri_paths)
+            
+        if hdri:
             self._log(f"[GL Init] Loading HDRI: {os.path.basename(hdri)}")
             self._renderer.load_hdri(hdri)
 
@@ -815,14 +891,138 @@ class GLGeneratorWorker(QThread):
                 self.finished.emit(False, "Generation stopped.")
                 return
 
-            # ── Randomize camera pose ─────────────────────────────────────────
-            azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
-            elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
-            dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
-            t    = i * 0.12   # simulated time for wave animation
+            # ── PER-FRAME CAMERA POSE ─────────────────────────────────────────
+            azim, elev, dist = self._azim_override, self._elev_override, self._dist_override
+            
+            if i > 0 and cfg.rand_pose:
+                # Frames > 0: Pure randomization if enabled
+                azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
+                elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
+                dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
+            
+            # Use defaults if overrides are missing
+            if azim is None: azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
+            if elev is None: elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
+            if dist is None: dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
+
+            # ── PER-FRAME VISUAL RANDOMIZATION ────────────────────────────────
+            env_str = self._env_strength_override
+            hdri_rot = self._hdri_rotation_override
+            laz, lel, lint = self._light_azim_override, self._light_elev_override, self._light_intensity_override
+            
+            if i > 0:
+                # Randomize HDRI if multiple are available
+                if cfg.rand_hdri and len(cfg.hdri_paths) > 1:
+                    new_hdri = _rng.choice(cfg.hdri_paths)
+                    self._renderer.load_hdri(new_hdri)
+                
+                # Randomize HDRI appearance
+                if cfg.rand_hdri:
+                    env_str = _rng.uniform(cfg.hdri_strength_min, cfg.hdri_strength_max)
+                    hdri_rot = _rng.uniform(0.0, 360.0)
+                
+                # Randomize Lighting
+                if cfg.rand_lighting:
+                    laz = _rng.uniform(0.0, 360.0)
+                    lel = _rng.uniform(10.0, 80.0)
+                    lint = _rng.uniform(cfg.brightness_min, cfg.brightness_max)
+                
+                # Randomize Objects
+                if cfg.rand_transform or cfg.bg_only_prob > 0:
+                    for obj in cfg.scene_objects:
+                        # Occasional visibility toggle (bg_only_prob)
+                        if _rng.random() < cfg.bg_only_prob:
+                            obj.visible = False
+                            continue
+                        obj.visible = True
+                        
+                        if cfg.rand_transform:
+                            # 1. Position Jitter
+                            if getattr(obj, 'rand_pos', True):
+                                t_max = getattr(obj, 'rand_translation_max', 1.0)
+                                obj.pos_x += _rng.uniform(-t_max, t_max)
+                                obj.pos_z += _rng.uniform(-t_max, t_max)
+                            
+                            # 2. Rotation Variety
+                            if getattr(obj, 'rand_rot', True):
+                                r_min = getattr(obj, 'rand_rot_min', 0.0)
+                                r_max = getattr(obj, 'rand_rot_max', 360.0)
+                                obj.rot_y = _rng.uniform(r_min, r_max)
+                            
+                            # 3. Scale Jitter
+                            if getattr(obj, 'rand_scale', True):
+                                s_jit = getattr(obj, 'rand_scale_jitter', 0.15)
+                                obj.scale *= _rng.uniform(1.0 - s_jit, 1.0 + s_jit)
+
+            # Time for waves
+            if i == 0 and self._time_override is not None:
+                t = self._time_override
+            else:
+                t = (i * 0.12 + (time.time() % 3600.0) if i == 0 else _rng.uniform(0.0, 1000.0))
+
+            # ── Physics update ────────────────────────────────────────────────
+            if cfg.ocean.enabled:
+                from app.engine.ocean_sim import ocean_physics
+                for obj in cfg.scene_objects:
+                    # Recalculate physics for EVERY frame to ensure sync with the ocean
+                    if getattr(obj, 'floating', False) and getattr(obj, 'visible', False):
+                        px, pz = getattr(obj, 'pos_x', 0.0), getattr(obj, 'pos_z', 0.0)
+                        o = cfg.ocean
+                        
+                        # Sync with exact logic in renderer (Time * Multiplier)
+                        t_physics = t * o.time_multiplier
+                        
+                        # Calculate storm intensity correctly matching viewport
+                        # Synchronized storm intensity handling
+                        storm = getattr(o, 'storm_intensity', 0.0)
+                        if cfg.weather and cfg.weather.type == "stormy":
+                            storm = max(storm, cfg.weather.intensity)
+
+                        # Get wave height for bobbing
+                        bob_intensity = getattr(obj, 'float_bob', 1.0)
+                        h = ocean_physics.get_wave_height(
+                            px, pz, t_physics,
+                            wind_speed=o.wind_speed,
+                            wind_direction=o.wind_direction,
+                            choppiness=o.choppiness,
+                            wave_amplitude=o.wave_amplitude,
+                            repetition_size=o.repetition_size,
+                            band0_multiplier=o.band0_multiplier,
+                            band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos,
+                            storm_intensity=storm
+                        ) * bob_intensity
+                        
+                        # Apply submergence offset (positive = deeper)
+                        submergence = getattr(obj, 'buoyancy_offset', 0.0)
+                        obj.pos_y = o.level + h - submergence
+
+                        # Tiling
+                        n = ocean_physics.get_surface_normal(
+                            px, pz, t_physics,
+                            wind_speed=o.wind_speed,
+                            wind_direction=o.wind_direction,
+                            choppiness=o.choppiness,
+                            wave_amplitude=o.wave_amplitude,
+                            repetition_size=o.repetition_size,
+                            band0_multiplier=o.band0_multiplier,
+                            band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos,
+                            storm_intensity=storm
+                        )
+                        import math
+                        tilt_strength = getattr(obj, 'float_tilt', 1.0)
+                        nx, ny, nz = n[0] * tilt_strength, n[1], n[2] * tilt_strength
+                        obj.rot_x = math.degrees(math.atan2(nz, ny))
+                        obj.rot_z = math.degrees(math.atan2(-nx, ny))
 
             # ── Render ────────────────────────────────────────────────────────
-            frame_np, bboxes = self._renderer.render_frame(cfg, azim, elev, dist, t)
+            frame_np, bboxes = self._renderer.render_frame(
+                cfg, azim, elev, dist, t, target=self._target,
+                light_azim=laz, light_elev=lel, light_intensity=lint,
+                env_strength=env_str,
+                hdri_rotation=hdri_rot
+            )
 
             # ── Save image ────────────────────────────────────────────────────
             name = f"{cfg.class_name.lower()}_{i:05d}"

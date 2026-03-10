@@ -6,6 +6,7 @@ Top-level QMainWindow that assembles all panels and wires the engine.
 
 import os
 import json
+import copy
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -113,7 +114,9 @@ class MainWindow(QMainWindow):
             QToolButton:hover { background: #1c2333; color: #cdd6f4; }
         """)
         self.options_menu = QMenu(self)
-        self.export_action = QAction("Export for Unity", self)
+        self.import_unity_action = QAction("Import from Unity (JSON)", self)
+        self.export_action = QAction("Export for Unity (JSON)", self)
+        self.options_menu.addAction(self.import_unity_action)
         self.options_menu.addAction(self.export_action)
         self.options_btn.setMenu(self.options_menu)
         tb_layout.addWidget(self.options_btn)
@@ -145,6 +148,7 @@ class MainWindow(QMainWindow):
         # ── Wire signals ─────────────────────────────────────────
         
         # System Actions
+        self.import_unity_action.triggered.connect(self._on_import_unity)
         self.export_action.triggered.connect(self._on_export_unity)
 
         # Viewport Play Controls (Unity style)
@@ -185,6 +189,39 @@ class MainWindow(QMainWindow):
         else:
             self.viewport.set_hdri("")
         self.viewport.update()
+
+    def _on_import_unity(self):
+        """Import a JSON scene configuration exported from Unity."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Unity Scene", "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+            
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            # Map Unity fields to SceneConfig
+            new_cfg = SceneConfig.from_unity_json(data)
+            
+            # Update active reference
+            self.cfg = new_cfg
+            
+            # Refresh all sub-views with new config
+            self.hierarchy.cfg = self.cfg
+            self.ocean_view.cfg = self.cfg
+            self.settings_view.cfg = self.cfg
+            
+            # Update Viewport & Hierarchy UI
+            self._on_config_updated()
+            self.console.append_log(f"[Import] Successfully loaded Unity scene from: {os.path.basename(path)}")
+            QMessageBox.information(self, "Import Successful", f"Scene data loaded from Unity.\n{len(self.cfg.scene_objects)} objects found.")
+        
+        except Exception as e:
+            self.console.append_log(f"[Import] Error: {e}")
+            QMessageBox.critical(self, "Import Failed", f"Failed to parse Unity configuration: {e}")
 
     def _on_export_unity(self):
         """Export the current SceneConfig to a JSON file for Unity ingestion."""
@@ -350,19 +387,27 @@ class MainWindow(QMainWindow):
         if manual_pose is None:
             self.viewport.set_loading(True)
 
-        # GLPreviewWorker takes explicit azim/elev/dist args (not a tuple)
+        # GLPreviewWorker takes explicit azim/elev/dist/target args
         if manual_pose is not None:
             dist, elev, azim = manual_pose
+            target = list(self.viewport._gl._target)
             self.preview_worker = PreviewWorker(
-                self.cfg, azim=azim, elev=elev, dist=dist)
+                self.cfg, azim=azim, elev=elev, dist=dist, target=target)
         else:
             # Default pose: mid-range values from config
             cfg = self.cfg
             azim = (cfg.azim_min + cfg.azim_max) / 2.0
             elev = (cfg.elev_min + cfg.elev_max) / 2.0
             dist = (cfg.dist_min + cfg.dist_max) / 2.0
+            target = list(self.viewport._gl._target)
+            
+            hdri_path = getattr(self.viewport._gl, '_hdri_path', "")
+            env_str = getattr(self.viewport._gl, '_env_strength', 1.0)
+            hdri_rot = getattr(self.viewport._gl, '_hdri_rotation', 0.0)
+            
             self.preview_worker = PreviewWorker(
-                self.cfg, azim=azim, elev=elev, dist=dist)
+                self.cfg, azim=azim, elev=elev, dist=dist, target=target,
+                hdri_path=hdri_path, env_strength=env_str, hdri_rotation=hdri_rot)
 
         self.preview_worker.preview_ready.connect(self._on_preview)
         self.preview_worker.log_message.connect(self.console.append_log)
@@ -390,7 +435,34 @@ class MainWindow(QMainWindow):
         self.viewport.clear_preview()
         self.stack.setCurrentIndex(2) # Switch to Preview/Viewport index
 
-        self.worker = GeneratorWorker(self.cfg)
+        # Create a deep copy of the config for the worker to avoid race conditions 
+        # when modifying object positions and rotations (Floating physics)
+        cloned_cfg = copy.deepcopy(self.cfg)
+        self.worker = GeneratorWorker(cloned_cfg)
+        # Sync current viewport camera and aspect to the worker
+        self.worker._target = list(self.viewport._gl._target)
+        # Force the worker to match the current viewport resolution for "Play" (num_images=1)
+        if self.cfg.num_images == 1:
+            cloned_cfg.image_width  = self.viewport._gl.width()
+            cloned_cfg.image_height = self.viewport._gl.height()
+            self.worker._azim_override = self.viewport._gl._azim
+            self.worker._elev_override = self.viewport._gl._elev
+            self.worker._dist_override = self.viewport._gl._dist
+            self.worker._light_azim_override      = self.viewport._gl._light_azim
+            self.worker._light_elev_override      = self.viewport._gl._light_elev
+            self.worker._light_intensity_override = self.viewport._gl._get_active_brightness()
+            
+            # Sync active HDRI if available
+            if hasattr(self.viewport._gl, '_hdri_path') and self.viewport._gl._hdri_path:
+                self.worker._hdri_override = self.viewport._gl._hdri_path
+            
+            # Sync rotation and strength
+            self.worker._hdri_rotation_override = getattr(self.viewport._gl, '_hdri_rotation', 0.0)
+            self.worker._env_strength_override  = getattr(self.viewport._gl, '_env_strength', 1.0)
+            # Sync time for waves (match viewport.py: rel_time = time.time() % 3600.0)
+            import time
+            self.worker._time_override = (time.time() % 3600.0)
+        
         self.worker.progress.connect(self._on_progress)
         self.worker.preview_ready.connect(self._on_preview)
         self.worker.log_message.connect(self.console.append_log)
