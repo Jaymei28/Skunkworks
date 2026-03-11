@@ -9,4 +9,7 @@ tqdm
 
 # AI & Rendering
 ultralytics
+PyOpenGL
+PyOpenGL-accelerate
+pyassimp
 # torch and pytorch3d are handled specially in the setup script for CUDA support

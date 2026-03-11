@@ -439,29 +439,30 @@ class MainWindow(QMainWindow):
         # when modifying object positions and rotations (Floating physics)
         cloned_cfg = copy.deepcopy(self.cfg)
         self.worker = GeneratorWorker(cloned_cfg)
-        # Sync current viewport camera and aspect to the worker
+        # Sync current viewport camera and aspect to the worker as the base pose
         self.worker._target = list(self.viewport._gl._target)
-        # Force the worker to match the current viewport resolution for "Play" (num_images=1)
+        self.worker._azim_override = self.viewport._gl._azim
+        self.worker._elev_override = self.viewport._gl._elev
+        self.worker._dist_override = self.viewport._gl._dist
+        self.worker._light_azim_override      = self.viewport._gl._light_azim
+        self.worker._light_elev_override      = self.viewport._gl._light_elev
+        self.worker._light_intensity_override = self.viewport._gl._get_active_brightness()
+        
+        # Sync active HDRI if available
+        if hasattr(self.viewport._gl, '_hdri_path') and self.viewport._gl._hdri_path:
+            self.worker._hdri_override = self.viewport._gl._hdri_path
+        
+        # Sync rotation and strength
+        self.worker._hdri_rotation_override = getattr(self.viewport._gl, '_hdri_rotation', 0.0)
+        self.worker._env_strength_override  = getattr(self.viewport._gl, '_env_strength', 1.0)
+        # Sync time for waves
+        import time
+        self.worker._time_override = (time.time() % 3600.0)
+
+        # Force the worker to match the current viewport resolution for "Play" (single click)
         if self.cfg.num_images == 1:
             cloned_cfg.image_width  = self.viewport._gl.width()
             cloned_cfg.image_height = self.viewport._gl.height()
-            self.worker._azim_override = self.viewport._gl._azim
-            self.worker._elev_override = self.viewport._gl._elev
-            self.worker._dist_override = self.viewport._gl._dist
-            self.worker._light_azim_override      = self.viewport._gl._light_azim
-            self.worker._light_elev_override      = self.viewport._gl._light_elev
-            self.worker._light_intensity_override = self.viewport._gl._get_active_brightness()
-            
-            # Sync active HDRI if available
-            if hasattr(self.viewport._gl, '_hdri_path') and self.viewport._gl._hdri_path:
-                self.worker._hdri_override = self.viewport._gl._hdri_path
-            
-            # Sync rotation and strength
-            self.worker._hdri_rotation_override = getattr(self.viewport._gl, '_hdri_rotation', 0.0)
-            self.worker._env_strength_override  = getattr(self.viewport._gl, '_env_strength', 1.0)
-            # Sync time for waves (match viewport.py: rel_time = time.time() % 3600.0)
-            import time
-            self.worker._time_override = (time.time() % 3600.0)
         
         self.worker.progress.connect(self._on_progress)
         self.worker.preview_ready.connect(self._on_preview)

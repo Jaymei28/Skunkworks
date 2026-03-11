@@ -312,8 +312,10 @@ void main(){
     if (uWeatherType == 4) fogColor = vec3(0.8, 0.85, 0.9);  // Snow
 
     float dist = length(uCamPos - vWorldPos);
-    float fogFactor = 1.0 - exp(-dist * uFogDensity * (0.8 + uWeatherIntensity * 2.0));
-    color = mix(color, fogColor, clamp(fogFactor, 0.0, 1.0));
+    if (uFogDensity > 0.0001) {
+        float fogFactor = 1.0 - exp(-dist * uFogDensity * (0.8 + uWeatherIntensity * 2.0));
+        color = mix(color, fogColor, clamp(fogFactor, 0.0, 1.0));
+    }
 
     if (uWeatherType >= 1) {
         float gray = dot(color, vec3(0.299, 0.587, 0.114));
@@ -514,8 +516,11 @@ void main(){
     vec3 sunSpec = spec * vec3(uLightIntensity * 50.0) * NdL;
     vec3 color = mix(colorBody, reflection, F) + sunSpec;
     color = mix(color, vec3(0.9, 0.95, 1.0), smoothstep(0.7, 1.0, crest) * 0.3); // Foam
-    float fog = 1.0 - exp(-length(uCamPos - vWorldPos) * uFogDensity);
-    color = mix(color, vec3(0.5, 0.6, 0.7), clamp(fog, 0.0, 1.0));
+    float dist = length(uCamPos - vWorldPos);
+    if (uFogDensity > 0.0001) {
+        float fog = 1.0 - exp(-dist * uFogDensity);
+        color = mix(color, vec3(0.5, 0.6, 0.7), clamp(fog, 0.0, 1.0));
+    }
     color = color / (color + vec3(1.0));
     color = pow(color, vec3(1.0 / 2.2));
     FragColor = vec4(color, uTransparency);
@@ -623,7 +628,6 @@ void main() {
     float t = uTime;
 
     // --- Weather Volume Rendering (Planar Ray-Casting) ---
-    // This removes the "spinning" distortion seen with spherical shells.
     float cosView = dot(rd, uCamFwd);
     if (cosView > 0.0) {
         // --- Rain (Type 2: rain, Type 3: stormy) ---
@@ -633,31 +637,23 @@ void main() {
                 float layer = float(i) + 1.0;
                 float dist = 1.0 + layer * 2.0;
                 float planeDist = dist / cosView;
-                
                 vec3 worldPos = uCamPos + rd * planeDist;
-                
-                // Lower resolution = bigger drops
                 float res = 6.0 + layer * 3.0; 
                 vec3 boxPos = worldPos * res;
                 boxPos.y += rainTime * (3.0 + layer * 0.5);
                 boxPos.x += boxPos.y * 0.035; 
-                
                 vec3 ip = floor(boxPos);
                 vec3 fp = fract(boxPos);
                 float h = hash(ip + layer * 19.7);
-                
                 if (h > 0.98 - uWeatherIntensity * 0.07) {
-                    // Rain drop: wider streaks
                     float drop = smoothstep(0.12, 0.0, abs(fp.x - 0.5));
                     drop *= smoothstep(0.15, 0.0, abs(fp.z - 0.5));
                     drop *= smoothstep(0.0, 0.2, fp.y) * smoothstep(1.0, 0.2, fp.y);
-                    
                     float alpha = drop * (0.4 + uWeatherIntensity * 0.6);
                     col += vec4(0.85, 0.9, 1.0, alpha * 0.7);
                 }
             }
         }
-
         // --- Snow (Type 4) ---
         if (uWeatherType == 4) {
             float snowTime = t * 1.5;
@@ -665,26 +661,20 @@ void main() {
                 float layer = float(i) + 1.0;
                 float dist = 2.0 + layer * 3.5;
                 float planeDist = dist / cosView;
-                
                 vec3 worldPos = uCamPos + rd * planeDist;
-                
                 float res = 4.0 + layer * 1.2;
                 vec3 boxPos = worldPos * res;
                 boxPos.y += snowTime * (1.1 - layer * 0.1);
                 boxPos.xz += sin(snowTime * 0.5 + worldPos.y * 0.1) * 0.4;
-                
                 vec3 ip = floor(boxPos);
                 vec3 fp = fract(boxPos);
                 float h = hash(ip + layer * 37.1);
-                
                 if (h > 0.96 - uWeatherIntensity * 0.1) {
                     float streak = 0.4 + layer * 0.3;
                     float d = length((fp - 0.5) / vec3(1.0, 1.0 + streak, 1.0));
                     float rSize = 0.06 + 0.1 * hash(ip + 13.3);
-                    
                     float glow = exp(-d * 7.0) * 0.5;
                     float core = smoothstep(rSize, rSize * 0.5, d);
-                    
                     vec3 snowCol = vec3(1.0);
                     float alpha = (core + glow) * (0.3 + uWeatherIntensity * 0.7);
                     col.rgb += snowCol * alpha;
@@ -693,12 +683,9 @@ void main() {
             }
         }
     }
-
-    // --- Stormy Lighting (Flash) ---
     if (uWeatherType == 3 && uThunderFlash > 0.01) {
         col += vec4(0.95, 1.0, 1.0, uThunderFlash * 0.5);
     }
-
     col = clamp(col, 0.0, 1.0);
     FragColor = col;
 }
@@ -814,46 +801,62 @@ uniform bool  uFisheyeEnabled;
 uniform float uFisheyeStrength;
 uniform float uAspect;
 
+uniform bool  uNoiseEnabled;
+uniform float uNoiseIntensity;
+uniform float uTime;
+
+uniform float uExposure;
+uniform bool  uWbEnabled;
+uniform float uWbTemp;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.71, 31.17))) * 43758.5453123); }
+
 void main(){
     vec2 uv = vUV;
+    float vignette = 1.0;
     
     if(uFisheyeEnabled){
-        // Normalized coordinates centered at 0 [-1, 1]
         vec2 p = vUV * 2.0 - 1.0;
-        
-        // Correct for aspect ratio to keep the lens circular
         p.x *= uAspect;
-        
         float d = length(p);
-        
-        // True panoramic fisheye mapping
-        // Curvilinear distortion (Equidistant-ish approximation)
-        // Strength scales how 'tight' the fisheye wrap is
         float k = uFisheyeStrength * 1.5;
         float nr = atan(d * k) / k;
-        
-        if (d > 0.001) {
-             p = (p / d) * nr;
-        }
-        
-        // Re-apply aspect and bring back to [0, 1]
+        if (d > 0.001) p = (p / d) * nr;
         p.x /= uAspect;
         uv = p * 0.5 + 0.5;
-        
-        // Smooth vignette mask based on original radius
-        // The vignette should scale with aspect
         float bind = (uAspect > 1.0) ? uAspect : 1.0;
-        float vignette = smoothstep(bind * 1.1, bind * 1.0, d);
-        
-        // Sample screen texture with wrap check
-        if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-            FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-        } else {
-            vec3 col = texture(uScreenTex, uv).rgb;
-            FragColor = vec4(col * vignette, 1.0);
-        }
+        vignette = smoothstep(bind * 1.1, bind * 1.0, d);
+    }
+
+    if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
     } else {
-        FragColor = texture(uScreenTex, uv);
+        vec3 col = texture(uScreenTex, uv).rgb;
+        if(uNoiseEnabled) {
+            float n = (hash(uv + fract(uTime)) - 0.5) * uNoiseIntensity;
+            col += n;
+        }
+
+        // White Balance
+        if(uWbEnabled) {
+            float t = uWbTemp / 100.0;
+            vec3 kelvin;
+            if(t <= 66.0) {
+                kelvin.r = 1.0;
+                kelvin.g = clamp(0.39 * log(t+0.0001) - 0.63, 0.0, 1.0);
+                kelvin.b = clamp(0.54 * log(t-10.0+0.0001) - 1.2, 0.0, 1.0);
+            } else {
+                kelvin.r = clamp(1.29 * pow(t-60.0, -0.13), 0.0, 1.0);
+                kelvin.g = clamp(1.12 * pow(t-60.0, -0.07), 0.0, 1.0);
+                kelvin.b = 1.0;
+            }
+            col *= kelvin;
+        }
+
+        // Exposure
+        col *= pow(2.0, uExposure);
+
+        FragColor = vec4(col * vignette, 1.0);
     }
 }
 """
@@ -1707,8 +1710,8 @@ class GL3DPreview(QOpenGLWidget):
             u_y =  math.cos(el)
             u_z = -math.cos(az) * math.sin(el)
             # Move target along camera right (horizontal) and up (vertical)
-            dx = -delta.x() * speed
-            dy =  delta.y() * speed
+            dx = -delta.x() * sens
+            dy =  delta.y() * sens
             self._target[0] += dx * r_x + dy * u_x
             self._target[1] += dx * r_y + dy * u_y
             self._target[2] += dx * r_z + dy * u_z
@@ -2463,13 +2466,16 @@ class GL3DPreview(QOpenGLWidget):
                 glEnable(GL_DEPTH_TEST)
                 glDepthFunc(GL_LESS)
                 self._set_v3(pbr_prog, "uCamPos", eye[0], eye[1], eye[2])
-                self._set_f(pbr_prog, "uEnvStrength", self._env_strength)
+                
+                env_s = self._env_strength
+                if self.cfg: env_s = self.cfg.hdri_strength
+                self._set_f(pbr_prog, "uEnvStrength", env_s)
                 self._set_f(pbr_prog, "uHdriRotation", math.radians(self._hdri_rotation))
                 self._set_f(pbr_prog, "uLightIntensity", base_light)
                 self._set_v3(pbr_prog, "uLightDir", 0.3, 0.8, 0.6) 
 
                 # --- Weather Uniforms ---
-                if self.cfg and self.cfg.weather:
+                if self.cfg and self.cfg.weather and self.cfg.weather.enabled:
                     w = self.cfg.weather
                     w_types = {"clear":0, "cloudy":1, "rain":2, "stormy":3, "snow":4, "foggy":5}
                     self._set_i(pbr_prog, "uWeatherType", w_types.get(w.type, 0))
@@ -2589,9 +2595,21 @@ class GL3DPreview(QOpenGLWidget):
                 
                 fe = self.cfg.post_process.fisheye_enabled if (self.cfg and self.cfg.post_process) else False
                 fs = self.cfg.post_process.fisheye_strength if (self.cfg and self.cfg.post_process) else 0.5
+                ne = self.cfg.post_process.noise_enabled if (self.cfg and self.cfg.post_process) else False
+                ni = self.cfg.post_process.noise_intensity if (self.cfg and self.cfg.post_process) else 0.0
+                
+                expo = self.cfg.post_process.exposure if (self.cfg and self.cfg.post_process) else 0.0
+                wbe  = self.cfg.post_process.wb_enabled if (self.cfg and self.cfg.post_process) else False
+                wbt  = self.cfg.post_process.wb_temp if (self.cfg and self.cfg.post_process) else 6500.0
                 
                 self._set_i(self._pp_prog, "uFisheyeEnabled", 1 if fe else 0)
                 self._set_f(self._pp_prog, "uFisheyeStrength", fs)
+                self._set_i(self._pp_prog, "uNoiseEnabled", 1 if ne else 0)
+                self._set_f(self._pp_prog, "uNoiseIntensity", ni)
+                self._set_f(self._pp_prog, "uExposure", expo)
+                self._set_i(self._pp_prog, "uWbEnabled", 1 if wbe else 0)
+                self._set_f(self._pp_prog, "uWbTemp", wbt)
+                self._set_f(self._pp_prog, "uTime", time.time() % 1000.0)
                 self._set_f(self._pp_prog, "uAspect", W / max(H, 1.0))
                 
                 glBindVertexArray(self._weather_vao) # reuse full-screen quad
@@ -2619,9 +2637,9 @@ class GL3DPreview(QOpenGLWidget):
     def _get_active_brightness(self):
         """Calculate the final light intensity based on base value, weather, and flash."""
         def _pmix(a, b, t): return a * (1.0 - t) + b * t
-        brightness = getattr(self, '_light_intensity', 3.5)
-        # Fallback if _light_intensity is not set (e.g. at startup)
-        if brightness < 1.0: brightness = 3.5 
+        
+        brightness = self.cfg.lighting_intensity if self.cfg else getattr(self, '_light_intensity', 3.5)
+        if brightness < 0.001: brightness = 3.5
 
         wt = "clear"
         if getattr(self, 'cfg', None) and getattr(self.cfg, 'weather', None):
@@ -3494,8 +3512,13 @@ class GL3DPreview(QOpenGLWidget):
         # Always bind a valid texture to unit 0 — Core Profile makes sampling
         # from an unbound sampler undefined.  We keep a 1x1 black stub texture
         # for exactly this case and swap in the real HDRI if one is loaded.
+        # env_tex binding
         glActiveTexture(GL_TEXTURE0)
         env_tex = getattr(self, '_env_tex', None)
+        env_s = self._env_strength
+        if self.cfg: env_s = self.cfg.hdri_strength
+        self._set_f(self._ocean_prog, "uEnvStrength", env_s)
+        
         # Use real HDRI if path is set, otherwise use procedural sky fallback
         if env_tex and self._hdri_path:
             glBindTexture(GL_TEXTURE_2D, int(env_tex))

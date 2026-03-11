@@ -459,13 +459,15 @@ class SceneHierarchyPanel(QWidget):
         self._main_layout.setSpacing(0)
 
         # ── Categorized Sections ──────────────────────────────
-        self.section_objects = CollapsibleSection("Objects")
-        self.section_hdri    = CollapsibleSection("HDRI's")
-        self.section_physics = CollapsibleSection("Physics & Global")
+        self.section_objects     = CollapsibleSection("Objects")
+        self.section_hdri        = CollapsibleSection("HDRI's")
+        self.section_ocean       = CollapsibleSection("Ocean Surface")
+        self.section_global_rand = CollapsibleSection("Global Randomizer")
 
         self._main_layout.addWidget(self.section_objects)
         self._main_layout.addWidget(self.section_hdri)
-        self._main_layout.addWidget(self.section_physics)
+        self._main_layout.addWidget(self.section_ocean)
+        self._main_layout.addWidget(self.section_global_rand)
         self._main_layout.addStretch()
 
         self._scroll.setWidget(self._list_widget)
@@ -477,7 +479,8 @@ class SceneHierarchyPanel(QWidget):
         """Rebuild all sections from current config."""
         self.section_objects.clear()
         self.section_hdri.clear()
-        self.section_physics.clear()
+        self.section_ocean.clear()
+        self.section_global_rand.clear()
         self._rows.clear()
 
         # 1. Objects
@@ -504,61 +507,210 @@ class SceneHierarchyPanel(QWidget):
 
         # 3. Physics / Global
         self._build_ocean_dropdown()
-        self._build_weather_dropdown()
-        self._build_camera_dropdown()
+        self._build_global_randomizer_section()
+
+    def select_object(self, obj: SceneObject):
+        """Programmatically select an object (e.g. from viewport click)."""
+        if obj and obj.instance_id in self._rows:
+            self._on_row_selected(obj)
+
+    def _build_global_randomizer_section(self):
+        """Builds a section showing all available global randomizer types."""
+        from .randomizer_widgets import GLOBAL_RANDOMIZERS, RandomizerComponentWidget
+        from app.engine.scene_state import RandomizerInstance
+
+        # Current active ones
+        active = {inst.type: inst for inst in self.cfg.hdri_randomizers}
+
+        for rand_type in GLOBAL_RANDOMIZERS:
+            inst = active.get(rand_type)
+            
+            # Row container
+            wrapper = QFrame()
+            wrapper.setObjectName("rand_wrapper")
+            wrapper.setStyleSheet("""
+                QFrame#rand_wrapper { 
+                    background: #1c2333; border: 1px solid #252d3d; 
+                    margin: 2px 8px; border-radius: 4px;
+                }
+            """)
+            wl = QVBoxLayout(wrapper)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setSpacing(0)
+
+            # Header row with checkbox
+            head = QHBoxLayout()
+            head.setContentsMargins(10, 8, 10, 8)
+            
+            chk = QCheckBox(rand_type)
+            chk.setStyleSheet("color: #cdd6f4; font-weight: 500; font-size: 11px;")
+            
+            chk.blockSignals(True)
+            chk.setChecked(inst is not None and getattr(inst, 'enabled', True))
+            chk.blockSignals(False)
+            
+            chk.toggled.connect(lambda v, t=rand_type: self._on_toggle_global_rand(t, v))
+            head.addWidget(chk)
+            head.addStretch()
+            wl.addLayout(head)
+
+            # If active, show settings below (only if enabled)
+            if inst and inst.enabled:
+                # Map of randomizer type to its parameters for compact display
+                # Format: (label, key, min, max, step)
+                param_configs = {
+                    "LightingRandomizer":      [("Brightness Min", "brightness_min", 0, 20), ("Brightness Max", "brightness_max", 0, 20)],
+                    "LightRandomizer":         [("Brightness Min", "brightness_min", 0, 20), ("Brightness Max", "brightness_max", 0, 20)],
+                    "HdriStrengthRandomizer":  [("Strength Min", "strength_min", 0, 10), ("Strength Max", "strength_max", 0, 10)],
+                    "WeatherRandomizer":        [("Intensity Min", "intensity_min", 0, 1, 0.05), ("Intensity Max", "intensity_max", 0, 1, 0.05)],
+                    "PostProcessRandomizer":   [("Fisheye Dist", "fisheye_strength", -1, 1, 0.05)],
+                    "BloomRandomizer":         [("Min", "bloom_min", 0, 5, 0.1), ("Max", "bloom_max", 0, 5, 0.1)],
+                    "ExposureRandomizer":      [("Min", "exposure_min", -5, 5, 0.1), ("Max", "exposure_max", -5, 5, 0.1)],
+                    "NoiseRandomizer":         [("Intensity", "noise_max", 0, 0.5, 0.01)],
+                    "WhiteBalanceRandomizer":  [("Min", "wb_temp_min", 2000, 12000, 500), ("Max", "wb_temp_max", 2000, 12000, 500)],
+                    "CameraPoseRandomizer":    [("Dist Min", "dist_min", 0, 5000, 1.0), ("Dist Max", "dist_max", 0, 5000, 1.0), 
+                                                ("Elev Min", "elev_min", -90, 90, 1.0), ("Elev Max", "elev_max", -90, 90, 1.0)],
+                    "HueOffsetRandomizer":     [("Hue Limit", "hue_limit", 0, 1, 0.05)],
+                    "AtmosphereRandomizer":   [("Fog Min", "fog_min", 0, 0.5, 0.01), ("Fog Max", "fog_max", 0, 0.5, 0.01)]
+                }
+                
+                if rand_type in param_configs:
+                    for label, key, min_v, max_v, *step_opt in param_configs[rand_type]:
+                        step = step_opt[0] if step_opt else 0.1
+                        val = inst.params.get(key, (min_v + max_v) / 2.0)
+                        
+                        s = CompactSlider(label, val, min_v, max_v, step)
+                        # Add some indentation for the parameters
+                        s.setContentsMargins(15, 0, 0, 0)
+                        s.valueChanged.connect(lambda v, t=rand_type, k=key: self._sync_global_rand_attr(t, k, v))
+                        wl.addWidget(s)
+                else:
+                    hint = QLabel("  (No tweakables for this type)")
+                    hint.setStyleSheet("color: #555; font-style: italic; font-size: 9px; margin-bottom: 4px;")
+                    wl.addWidget(hint)
+
+            self.section_global_rand.add_widget(wrapper)
+
+    def _sync_global_rand_attr(self, rand_type, attr, val):
+        for i in self.cfg.hdri_randomizers:
+            if i.type == rand_type:
+                i.params[attr] = val
+                self._apply_global_rand_to_config(rand_type, i.enabled)
+                break
+        self.scene_changed.emit()
+
+    def _on_toggle_global_rand(self, rand_type, checked):
+        from app.engine.scene_state import RandomizerInstance
+        found = False
+        target_inst = None
+        for i in self.cfg.hdri_randomizers:
+            if i.type == rand_type:
+                i.enabled = checked
+                target_inst = i
+                found = True
+                break
+        
+        if not found and checked:
+            from app.engine.scene_state import RandomizerInstance
+            target_inst = RandomizerInstance(type=rand_type, enabled=True)
+            self.cfg.hdri_randomizers.append(target_inst)
+        
+        if target_inst:
+            self._apply_global_rand_to_config(rand_type, checked)
+        
+        # UI Refresh
+        self.refresh()
+        self.scene_changed.emit()
+
+    def _apply_global_rand_to_config(self, rand_type, enabled):
+        """Sync randomizer settings to live config for viewport preview."""
+        cfg = self.cfg
+        t = rand_type.lower()
+        
+        # Find the instance to get peak params
+        inst = None
+        for r in cfg.hdri_randomizers:
+            if r.type == rand_type:
+                inst = r
+                break
+        
+        if "atmos" in t:
+            cfg.weather.enabled = enabled
+            if inst: cfg.weather.fog_density = inst.params.get("fog_max", 0.05)
+        elif "noise" in t:
+            cfg.post_process.noise_enabled = enabled
+            if inst: cfg.post_process.noise_intensity = inst.params.get("noise_max", 0.05)
+        elif "weather" in t:
+            cfg.weather.enabled = enabled
+            if inst: cfg.weather.intensity = inst.params.get("intensity_max", 0.5)
+        elif "post" in t:
+            cfg.post_process.fisheye_enabled = enabled
+            if inst: cfg.post_process.fisheye_strength = inst.params.get("fisheye_strength", 0.0)
+        elif "bloom" in t:
+            cfg.post_process.bloom_enabled = enabled
+            if inst: cfg.post_process.bloom_intensity = inst.params.get("bloom_max", 0.3)
+        elif "exposure" in t:
+            cfg.post_process.exposure_enabled = enabled
+            if inst: cfg.post_process.exposure = inst.params.get("exposure_max", 0.0)
+        elif "white" in t or "balance" in t:
+            cfg.post_process.wb_enabled = enabled
+            if inst: cfg.post_process.wb_temp = inst.params.get("wb_temp_max", 6500)
+        elif "lighting" in t or "light" in t:
+            if inst and enabled:
+                val = inst.params.get("brightness_max", 3.5)
+                cfg.lighting_intensity = val
+        elif "hdri" in t:
+            if inst and enabled:
+                val = inst.params.get("strength_max", 1.0)
+                cfg.hdri_strength = val
 
     def _build_ocean_dropdown(self):
-        container = CollapsibleSection("Ocean Surface Settings")
-        container.header.setStyleSheet(container.header.styleSheet().replace("#1c2333", "#121620"))
-        container.header.setText("\u25b6 OCEAN SURFACE")
-        container.header.setChecked(False)
-        
         o = self.cfg.ocean
         
         cb = QCheckBox("Enable Ocean")
         cb.setChecked(o.enabled)
         cb.setStyleSheet("color: #cdd6f4; font-size: 10px; margin-left: 12px; margin-top: 4px;")
         cb.toggled.connect(self._sync_ocean_enabled)
-        container.add_widget(cb)
+        self.section_ocean.add_widget(cb)
 
         def add_sub(text):
             from PySide6.QtWidgets import QLabel
             lbl = QLabel(text.upper())
             lbl.setStyleSheet("color: #4fc3f7; font-size: 8px; font-weight: bold; margin-left: 12px; margin-top: 8px;")
-            container.add_widget(lbl)
+            self.section_ocean.add_widget(lbl)
 
         add_sub("Simulation")
-        container.add_widget(CompactSlider("Level (m)", o.level, -20, 20))
-        container.add_widget(CompactSlider("Repetition", o.repetition_size, 10, 2000, 50))
+        self.section_ocean.add_widget(CompactSlider("Level (m)", o.level, -20, 20))
+        self.section_ocean.add_widget(CompactSlider("Repetition", o.repetition_size, 10, 2000, 50))
         
         add_sub("Waves & Bands")
-        container.add_widget(CompactSlider("Amplitude", o.wave_amplitude, 0, 10))
-        container.add_widget(CompactSlider("Wind Speed", o.wind_speed, 0, 100))
-        container.add_widget(CompactSlider("Choppiness", o.choppiness, 0, 5))
-        container.add_widget(CompactSlider("Band 0 Mul", o.band0_multiplier, 0, 2, 0.1))
-        container.add_widget(CompactSlider("Band 1 Mul", o.band1_multiplier, 0, 2, 0.1))
+        self.section_ocean.add_widget(CompactSlider("Amplitude", o.wave_amplitude, 0, 10))
+        self.section_ocean.add_widget(CompactSlider("Wind Speed", o.wind_speed, 0, 100))
+        self.section_ocean.add_widget(CompactSlider("Choppiness", o.choppiness, 0, 5))
+        self.section_ocean.add_widget(CompactSlider("Band 0 Mul", o.band0_multiplier, 0, 2, 0.1))
+        self.section_ocean.add_widget(CompactSlider("Band 1 Mul", o.band1_multiplier, 0, 2, 0.1))
 
         add_sub("Currents & Ripples")
-        container.add_widget(CompactSlider("Curr Speed", o.current_speed, 0, 20, 0.5))
-        container.add_widget(CompactSlider("Rip Speed", o.ripples_wind_speed, 0, 50, 0.5))
+        self.section_ocean.add_widget(CompactSlider("Curr Speed", o.current_speed, 0, 20, 0.5))
+        self.section_ocean.add_widget(CompactSlider("Rip Speed", o.ripples_wind_speed, 0, 50, 0.5))
 
         add_sub("Scattering & Material")
         w_col = CompactColor("Refraction", o.refraction_color)
-        w_col.colorChanged.connect(lambda c: self._sync_ocean_attr("refraction_color", [c.redF(), c.greenF(), c.blueF()]))
-        container.add_widget(w_col)
+        w_col.colorChanged.connect(self.scene_changed.emit)
+        self.section_ocean.add_widget(w_col)
         
         w_scat = CompactColor("Scattering", o.scattering_color)
-        w_scat.colorChanged.connect(lambda c: self._sync_ocean_attr("scattering_color", [c.redF(), c.greenF(), c.blueF()]))
-        container.add_widget(w_scat)
+        w_scat.colorChanged.connect(self.scene_changed.emit)
+        self.section_ocean.add_widget(w_scat)
         
-        container.add_widget(CompactSlider("Tip Scat", o.direct_light_tip_scattering, 0, 2, 0.1))
-        container.add_widget(CompactSlider("Body Scat", o.direct_light_body_scattering, 0, 2, 0.1))
-        container.add_widget(CompactSlider("Smoothness", o.smoothness, 0, 1, 0.05))
+        self.section_ocean.add_widget(CompactSlider("Tip Scat", o.direct_light_tip_scattering, 0, 2, 0.1))
+        self.section_ocean.add_widget(CompactSlider("Body Scat", o.direct_light_body_scattering, 0, 2, 0.1))
+        self.section_ocean.add_widget(CompactSlider("Smoothness", o.smoothness, 0, 1, 0.05))
 
         # Re-wire logic
         from PySide6.QtWidgets import QLabel
-        for i in range(container.content_layout.count()):
-            it = container.content_layout.itemAt(i)
+        for i in range(self.section_ocean.content_layout.count()):
+            it = self.section_ocean.content_layout.itemAt(i)
             if not it: continue
             widget = it.widget()
             if isinstance(widget, CompactSlider):
@@ -587,171 +739,9 @@ class SceneHierarchyPanel(QWidget):
         """)
         nav_btn.clicked.connect(lambda: self.navigation_requested.emit("ocean"))
         nav_l.addWidget(nav_btn)
-        container.add_widget(nav_row)
-        self.section_physics.add_widget(container)
+        self.section_ocean.add_widget(nav_row)
 
-    def _build_weather_dropdown(self):
-        container = CollapsibleSection("Weather & Post-Process")
-        container.header.setStyleSheet(container.header.styleSheet().replace("#1c2333", "#121620"))
-        container.header.setText("▶ ATMOSPHERE & RENDER")
-        container.header.setChecked(False)
-
-        w = self.cfg.weather
-        pp = self.cfg.post_process
-
-        # 1. Weather Type & Intensity
-        type_row = QWidget()
-        type_row.setStyleSheet("background: transparent; margin: 4px 8px;")
-        th = QHBoxLayout(type_row)
-        th.setContentsMargins(0, 0, 0, 0)
-        t_lbl = QLabel("Weather Type")
-        t_lbl.setStyleSheet("color: #8b949e; font-size: 10px; font-weight: bold;")
-        
-        self.weather_combo = QComboBox()
-        self.weather_combo.addItems(["clear", "cloudy", "rain", "stormy", "snow", "foggy"])
-        self.weather_combo.setCurrentText(w.type)
-        self.weather_combo.setFixedHeight(22)
-        self.weather_combo.setStyleSheet("""
-            QComboBox { background: #0d1117; color: #cdd6f4; border: 1px solid #30363d; 
-                        border-radius: 3px; font-size: 10px; padding: 2px 5px; }
-            QComboBox::drop-down { border: none; }
-        """)
-        self.weather_combo.currentTextChanged.connect(self._sync_weather_type)
-        
-        th.addWidget(t_lbl)
-        th.addStretch()
-        th.addWidget(self.weather_combo)
-        container.add_widget(type_row)
-
-        intensity = CompactSlider("Intensity", w.intensity, 0, 1, 0.05)
-        intensity.valueChanged.connect(self._sync_weather_intensity)
-        container.add_widget(intensity)
-
-        fog = CompactSlider("Fog Density", w.fog_density, 0, 1, 0.01)
-        fog.valueChanged.connect(self._sync_weather_fog)
-        container.add_widget(fog)
-
-        exp = CompactSlider("Global Exposure", pp.exposure_max, -2, 2, 0.1)
-        exp.valueChanged.connect(lambda v: self._sync_pp_attr("exposure_max", v))
-        container.add_widget(exp)
-
-        bloom = CompactSlider("Bloom Intensity", pp.bloom_max, 0, 1, 0.05)
-        bloom.valueChanged.connect(lambda v: self._sync_pp_attr("bloom_max", v))
-        container.add_widget(bloom)
-
-        noise = CompactSlider("Grain / Noise", pp.noise_max, 0, 0.2, 0.01)
-        noise.valueChanged.connect(lambda v: self._sync_pp_attr("noise_max", v))
-        container.add_widget(noise)
-
-        # Dataset globals
-        w_size = CompactSlider("Dataset Width", self.cfg.image_width, 128, 4096, 64)
-        w_size.valueChanged.connect(self._sync_global_width)
-        container.add_widget(w_size)
-
-        h_size = CompactSlider("Dataset Height", self.cfg.image_height, 128, 4096, 64)
-        h_size.valueChanged.connect(self._sync_global_height)
-        container.add_widget(h_size)
-        
-        self.section_physics.add_widget(container)
-
-    def _build_camera_dropdown(self):
-        container = CollapsibleSection("Camera Lens")
-        container.header.setStyleSheet(container.header.styleSheet().replace("#1c2333", "#121620"))
-        container.header.setText("▶ CAMERA LENS")
-        container.header.setChecked(False)
-
-        # Lens Type Presets 
-        type_row = QWidget()
-        type_row.setStyleSheet("background: transparent; margin: 4px 8px;")
-        th = QHBoxLayout(type_row)
-        th.setContentsMargins(0, 0, 0, 0)
-        t_lbl = QLabel("Lens Type")
-        t_lbl.setStyleSheet("color: #8b949e; font-size: 10px; font-weight: bold;")
-        
-        self.lens_combo = QComboBox()
-        self.lens_combo.addItems([
-            "Wide (14mm)", "Wide (24mm)", "Standard (35mm)", 
-            "Standard (50mm)", "Portrait (85mm)", "Telephoto (200mm)", "Custom"
-        ])
-        
-        fl = getattr(self.cfg, 'focal_length', 50.0)
-        if fl == 14: self.lens_combo.setCurrentText("Wide (14mm)")
-        elif fl == 24: self.lens_combo.setCurrentText("Wide (24mm)")
-        elif fl == 35: self.lens_combo.setCurrentText("Standard (35mm)")
-        elif fl == 50: self.lens_combo.setCurrentText("Standard (50mm)")
-        elif fl == 85: self.lens_combo.setCurrentText("Portrait (85mm)")
-        elif fl == 200: self.lens_combo.setCurrentText("Telephoto (200mm)")
-        else: self.lens_combo.setCurrentText("Custom")
-        
-        self.lens_combo.setFixedHeight(20)
-        self.lens_combo.setStyleSheet("""
-            QComboBox { background: #0d1117; color: #cdd6f4; border: 1px solid #30363d; 
-                        border-radius: 3px; font-size: 9px; padding: 1px 4px; }
-            QComboBox::drop-down { border: none; }
-        """)
-        self.lens_combo.currentTextChanged.connect(self._on_lens_preset_changed)
-        
-        th.addWidget(t_lbl)
-        th.addStretch()
-        th.addWidget(self.lens_combo)
-        container.add_widget(type_row)
-
-        self.fl_spinner = CompactSlider("Focal Length (mm)", fl, 1.0, 1000.0, 1.0)
-        self.fl_spinner.valueChanged.connect(self._sync_focal_length)
-        container.add_widget(self.fl_spinner)
-
-        # Info label for FOV
-        self.fov_info = QLabel(f"Field of View: {self.cfg.fov_y:.1f}°")
-        self.fov_info.setStyleSheet("color: #555; font-size: 9px; margin-left: 14px; margin-bottom: 4px;")
-        container.add_widget(self.fov_info)
-
-        # --- Fisheye Settings ---
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Plain)
-        line.setStyleSheet("background-color: #30363d; margin: 4px 8px;")
-        container.add_widget(line)
-
-        fe_row = QWidget()
-        fe_row.setStyleSheet("background: transparent; margin: 2px 8px;")
-        fe_l = QHBoxLayout(fe_row)
-        fe_l.setContentsMargins(0, 0, 0, 0)
-        
-        fe_lbl = QLabel("Fisheye Effect")
-        fe_lbl.setStyleSheet("color: #8b949e; font-size: 10px; font-weight: bold;")
-        from PySide6.QtWidgets import QCheckBox
-        self.fe_active = QCheckBox()
-        self.fe_active.setChecked(self.cfg.post_process.fisheye_enabled)
-        self.fe_active.toggled.connect(lambda v: self._sync_pp_attr('fisheye_enabled', v))
-        
-        fe_l.addWidget(fe_lbl)
-        fe_l.addStretch()
-        fe_l.addWidget(self.fe_active)
-        container.add_widget(fe_row)
-
-        self.fe_strength = CompactSlider("Distortion", self.cfg.post_process.fisheye_intensity, 0.0, 2.0, 0.05)
-        self.fe_strength.valueChanged.connect(lambda v: self._sync_pp_attr('fisheye_intensity', v))
-        container.add_widget(self.fe_strength)
-
-        self.section_physics.add_widget(container)
-
-    def _sync_focal_length(self, val):
-        import math
-        self.cfg.focal_length = val
-        # FOV_y = 2 * atan(sensor_height / (2 * focal_length))
-        # Sensor height for 35mm full frame is 24mm.
-        self.cfg.fov_y = math.degrees(2.0 * math.atan(12.0 / max(0.1, val)))
-        if hasattr(self, 'fov_info'):
-            self.fov_info.setText(f"Field of View: {self.cfg.fov_y:.1f}°")
-        self.scene_changed.emit()
-
-    def _on_lens_preset_changed(self, text):
-        mapping = {
-            "Wide (14mm)": 14.0, "Wide (24mm)": 24.0, "Standard (35mm)": 35.0,
-            "Standard (50mm)": 50.0, "Portrait (85mm)": 85.0, "Telephoto (200mm)": 200.0
-        }
-        if text in mapping:
-            self.fl_spinner.sb.setValue(mapping[text])
+        self.section_ocean.add_widget(nav_row)
 
     def _sync_pp_attr(self, attr, val):
         setattr(self.cfg.post_process, attr, val)

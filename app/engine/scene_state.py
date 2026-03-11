@@ -16,6 +16,7 @@ class RandomizerInstance:
     """A single active randomizer on an object."""
     type:   str = "ObjectPlacementRandomizer"
     params: dict = field(default_factory=dict)
+    enabled: bool = True
 
 @dataclass
 class ObjectConfig:
@@ -61,9 +62,9 @@ class SceneObject:
     is_focus_target: bool = False   # If true, camera orbits THIS object during generation
     
     # Per-Object Randomization
-    rand_pos:   bool = True
-    rand_rot:   bool = True
-    rand_scale: bool = True
+    rand_pos:   bool = False
+    rand_rot:   bool = False
+    rand_scale: bool = False
     rand_translation_max: float = 1.0
     rand_scale_jitter:    float = 0.15
     rand_rot_min:         float = 0.0
@@ -79,7 +80,7 @@ class WeatherConfig:
     enabled:      bool  = True
     type:         str   = "clear"       # clear, cloudy, rain, stormy, snow, foggy
     intensity:    float = 0.5           # 0..1 intensity of rain/snow/clouds
-    fog_density:  float = 0.05
+    fog_density:  float = 0.0
     
     weights: Dict[str, float] = field(default_factory=lambda: {
         "clear":    0.35,
@@ -97,30 +98,32 @@ class PostProcessConfig:
     exposure_enabled:  bool  = True
     exposure_min:      float = -0.5
     exposure_max:      float =  0.5
+    exposure:          float =  0.0
 
-    bloom_enabled:     bool  = True
+    bloom_enabled:     bool  = False
     bloom_min:         float =  0.0
     bloom_max:         float =  0.30
     bloom_threshold:   float =  0.70
+    bloom_intensity:   float =  0.0
 
-    noise_enabled:     bool  = True
+    noise_enabled:     bool  = False
     noise_mode:        str   = "random"   # "small" | "large" | "random"
     noise_min:         float =  0.0
     noise_max:         float =  0.06
+    noise_intensity:   float =  0.0
 
-    ao_enabled:        bool  = True
+    ao_enabled:        bool  = False
     
     # Fish-eye Distortion
     fisheye_enabled:   bool  = False
-    fisheye_intensity: float = 0.5
+    fisheye_strength:  float = 0.5
 
-    wb_enabled:        bool  = True
-
-    wb_enabled:        bool  = True
+    wb_enabled:        bool  = False
     wb_temp_min:       float =  3500.0
     wb_temp_max:       float =  8500.0
+    wb_temp:           float =  6500.0
 
-    blur_enabled:      bool  = True
+    blur_enabled:      bool  = False
     blur_min:          float =  0.0
     blur_max:          float =  1.8
 
@@ -191,11 +194,11 @@ class SceneConfig:
     output_dir: str = ""
     
     # ── Randomization Toggles ────────────────────────────────────
-    rand_pose:      bool = True
-    rand_hdri:      bool = True
-    rand_lighting:  bool = True
-    rand_transform: bool = True
-    rand_weather:   bool = True
+    rand_pose:      bool = False
+    rand_hdri:      bool = False
+    rand_lighting:  bool = False
+    rand_transform: bool = False
+    rand_weather:   bool = False
     
     # ── Global / HDRI Randomizers ────────────────────────────────
     hdri_randomizers: List[RandomizerInstance] = field(default_factory=list)
@@ -212,7 +215,7 @@ class SceneConfig:
     image_width:    int   = 640
     image_height:   int   = 480
     num_obj_max:    int   = 3
-    bg_only_prob:   float = 0.10
+    bg_only_prob:   float = 0.0
     class_name:     str   = "Object" # Default / global
     output_format:  str   = "yolo"    # "yolo" | "coco"
 
@@ -236,6 +239,8 @@ class SceneConfig:
     # ── Lighting ─────────────────────────────────────────────────
     brightness_min: float = 0.5
     brightness_max: float = 1.6
+    lighting_intensity: float = 1.0
+    hdri_strength: float = 1.0
 
     # ── Depth-aware transform ──────────────────────────────────────
     target_frac_min: float = 0.10

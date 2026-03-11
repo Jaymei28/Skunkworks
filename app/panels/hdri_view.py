@@ -134,7 +134,7 @@ class HDRIPanel(QWidget):
                 item.widget().deleteLater()
         
         for idx, inst in enumerate(self.cfg.hdri_randomizers):
-            comp = RandomizerComponentWidget(inst)
+            comp = RandomizerComponentWidget(inst, mode="global")
             comp.removed.connect(lambda i=idx: self._on_remove_randomizer(i))
             comp.updated.connect(self.config_updated.emit)
             self.rand_list_layout.addWidget(comp)

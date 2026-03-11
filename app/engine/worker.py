@@ -212,8 +212,11 @@ class GeneratorWorker(QThread):
             weather_type      = "clear"
             weather_intensity = 0.0
             pp_rand_active    = None
+            hue_rand_active   = None
 
             for r_inst in cfg.hdri_randomizers:
+                if not getattr(r_inst, 'enabled', True):
+                    continue
                 try:
                     r_obj = self._get_randomizer_inst(r_inst.type, r_inst.params)
                     if r_obj is None:
@@ -289,6 +292,17 @@ class GeneratorWorker(QThread):
                         )
                         pp_rand_active.randomize()
 
+                    elif "hue" in t:
+                        # HueOffsetRandomizer — configure and collect for later
+                        hue_rand_active = r_obj
+
+                    elif "atmos" in t:
+                        # AtmosphereRandomizer — set fog density
+                        cfg.weather.fog_density = random.uniform(
+                            float(r_inst.params.get("fog_min", 0.01)),
+                            float(r_inst.params.get("fog_max", 0.10))
+                        )
+
                     else:
                         # Generic fallback: call apply on the renderer
                         r_obj.apply(renderer)
@@ -306,6 +320,8 @@ class GeneratorWorker(QThread):
                     m_instance = mesh.clone()
 
                     for r_inst in m_cfg.randomizers:
+                        if not getattr(r_inst, 'enabled', True):
+                            continue
                         try:
                             r_obj = self._get_randomizer_inst(r_inst.type, r_inst.params)
                             if r_obj is None:
@@ -442,6 +458,9 @@ class GeneratorWorker(QThread):
 
             if pp_rand_active is not None:
                 comp = pp_rand_active.apply(comp)
+
+            if hue_rand_active is not None:
+                comp = hue_rand_active.apply(comp)
 
             # ---- Save ----
             name    = f"{cfg.class_name.lower()}_{i:05d}"
@@ -891,74 +910,100 @@ class GLGeneratorWorker(QThread):
                 self.finished.emit(False, "Generation stopped.")
                 return
 
-            # ── PER-FRAME CAMERA POSE ─────────────────────────────────────────
+            # Initialize base params from overrides or config
             azim, elev, dist = self._azim_override, self._elev_override, self._dist_override
-            
-            if i > 0 and cfg.rand_pose:
-                # Frames > 0: Pure randomization if enabled
-                azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
-                elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
-                dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
-            
-            # Use defaults if overrides are missing
-            if azim is None: azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
-            if elev is None: elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
-            if dist is None: dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
-
-            # ── PER-FRAME VISUAL RANDOMIZATION ────────────────────────────────
             env_str = self._env_strength_override
             hdri_rot = self._hdri_rotation_override
             laz, lel, lint = self._light_azim_override, self._light_elev_override, self._light_intensity_override
             
+            # --- Global Randomizers Loop ---
+            for r_inst in cfg.hdri_randomizers:
+                if not getattr(r_inst, 'enabled', True):
+                    continue
+                t = r_inst.type.lower()
+                
+                if "camera" in t or "pose" in t:
+                    dist = _rng.uniform(r_inst.params.get("dist_min", cfg.dist_min), r_inst.params.get("dist_max", cfg.dist_max))
+                    elev = _rng.uniform(r_inst.params.get("elev_min", cfg.elev_min), r_inst.params.get("elev_max", cfg.elev_max))
+                    azim = _rng.uniform(0, 360)
+                elif "hdristrength" in t or "hdri_strength" in t:
+                    env_str = _rng.uniform(r_inst.params.get("strength_min", cfg.hdri_strength_min), r_inst.params.get("strength_max", cfg.hdri_strength_max))
+                elif "lighting" in t or "light" in t:
+                    lint = _rng.uniform(r_inst.params.get("brightness_min", cfg.brightness_min), r_inst.params.get("brightness_max", cfg.brightness_max))
+                    laz = _rng.uniform(0, 360)
+                    lel = _rng.uniform(10, 80)
+                elif "post" in t:
+                    cfg.post_process.fisheye_strength = r_inst.params.get("fisheye_strength", 0.0)
+                elif "atmos" in t:
+                    cfg.weather.fog_density = _rng.uniform(r_inst.params.get("fog_min", 0.01), r_inst.params.get("fog_max", 0.10))
+                elif "bloom" in t:
+                    cfg.post_process.bloom_intensity = _rng.uniform(r_inst.params.get("bloom_min", 0.0), r_inst.params.get("bloom_max", 0.5))
+                elif "exposure" in t:
+                    cfg.post_process.exposure = _rng.uniform(r_inst.params.get("exposure_min", -0.5), r_inst.params.get("exposure_max", 0.5))
+                elif "noise" in t:
+                    cfg.post_process.noise_max = r_inst.params.get("noise_max", 0.05)
+                elif "white" in t or "balance" in t:
+                    cfg.post_process.wb_temp = _rng.uniform(r_inst.params.get("wb_temp_min", 4500), r_inst.params.get("wb_temp_max", 8500))
+
+            # --- Defaults for missing/unconfigured ---
+            # 1. Component Randomizers are already handled (they modified azim, elev, dist).
+            # 2. Legacy Global Pose Randomization (if explicit components didn't touch it)
+            if cfg.rand_pose:
+                # If no component was active, perform legacy random walk within global ranges
+                # We check against the overrides to see if they were changed by components.
+                if azim == self._azim_override: azim = _rng.uniform(cfg.azim_min, cfg.azim_max)
+                if elev == self._elev_override: elev = _rng.uniform(cfg.elev_min, cfg.elev_max)
+                if dist == self._dist_override: dist = _rng.uniform(cfg.dist_min, cfg.dist_max)
+            
+            # 3. Final Fallback (if azim/elev/dist are STILL None, e.g. no overrides and no randomization)
+            if azim is None: azim = (cfg.azim_min + cfg.azim_max) / 2.0
+            if elev is None: elev = (cfg.elev_min + cfg.elev_max) / 2.0
+            if dist is None: dist = (cfg.dist_min + cfg.dist_max) / 2.0
+
+            # --- Per-Frame Logic ---
             if i > 0:
                 # Randomize HDRI if multiple are available
                 if cfg.rand_hdri and len(cfg.hdri_paths) > 1:
                     new_hdri = _rng.choice(cfg.hdri_paths)
                     self._renderer.load_hdri(new_hdri)
+            
+            # ── Temporary Transforms (Shadow Copy) ────────────────────────────
+            # We must NOT mutate cfg.scene_objects directly to avoid drift and UI sync issues.
+            temp_objects = []
+            import copy
+            for obj in cfg.scene_objects:
+                tmp = copy.copy(obj)
                 
-                # Randomize HDRI appearance
-                if cfg.rand_hdri:
-                    env_str = _rng.uniform(cfg.hdri_strength_min, cfg.hdri_strength_max)
-                    hdri_rot = _rng.uniform(0.0, 360.0)
+                # Apply per-frame randomization if enabled
+                if cfg.rand_transform:
+                    if getattr(obj, 'rand_pos', False):
+                        t_max = getattr(obj, 'rand_translation_max', 1.0)
+                        tmp.pos_x += _rng.uniform(-t_max, t_max)
+                        tmp.pos_z += _rng.uniform(-t_max, t_max)
+                    if getattr(obj, 'rand_rot', False):
+                        r_min = getattr(obj, 'rand_rot_min', 0.0)
+                        r_max = getattr(obj, 'rand_rot_max', 360.0)
+                        tmp.rot_y = _rng.uniform(r_min, r_max)
+                    if getattr(obj, 'rand_scale', False):
+                        s_jit = getattr(obj, 'rand_scale_jitter', 0.15)
+                        tmp.scale *= _rng.uniform(1.0 - s_jit, 1.0 + s_jit)
                 
-                # Randomize Lighting
-                if cfg.rand_lighting:
-                    laz = _rng.uniform(0.0, 360.0)
-                    lel = _rng.uniform(10.0, 80.0)
-                    lint = _rng.uniform(cfg.brightness_min, cfg.brightness_max)
-                
-                # Randomize Objects
-                if cfg.rand_transform or cfg.bg_only_prob > 0:
-                    for obj in cfg.scene_objects:
-                        # Occasional visibility toggle (bg_only_prob)
-                        if _rng.random() < cfg.bg_only_prob:
-                            obj.visible = False
-                            continue
-                        obj.visible = True
-                        
-                        if cfg.rand_transform:
-                            # 1. Position Jitter
-                            if getattr(obj, 'rand_pos', True):
-                                t_max = getattr(obj, 'rand_translation_max', 1.0)
-                                obj.pos_x += _rng.uniform(-t_max, t_max)
-                                obj.pos_z += _rng.uniform(-t_max, t_max)
-                            
-                            # 2. Rotation Variety
-                            if getattr(obj, 'rand_rot', True):
-                                r_min = getattr(obj, 'rand_rot_min', 0.0)
-                                r_max = getattr(obj, 'rand_rot_max', 360.0)
-                                obj.rot_y = _rng.uniform(r_min, r_max)
-                            
-                            # 3. Scale Jitter
-                            if getattr(obj, 'rand_scale', True):
-                                s_jit = getattr(obj, 'rand_scale_jitter', 0.15)
-                                obj.scale *= _rng.uniform(1.0 - s_jit, 1.0 + s_jit)
+                # Occasional visibility toggle (bg_only_prob)
+                if i > 0 and cfg.bg_only_prob > 0 and _rng.random() < cfg.bg_only_prob:
+                    tmp.visible = False
+                else:
+                    tmp.visible = True
+                    
+                temp_objects.append(tmp)
 
-            # Time for waves
-            if i == 0 and self._time_override is not None:
-                t = self._time_override
-            else:
-                t = (i * 0.12 + (time.time() % 3600.0) if i == 0 else _rng.uniform(0.0, 1000.0))
+            # Swap list temporarily for physics and render
+            orig_objects = cfg.scene_objects
+            cfg.scene_objects = temp_objects
+
+            # Time for waves: use a stable increment from the preview time to ensure consistency 
+            # while still allowing some movement across the batch.
+            base_t = self._time_override if self._time_override is not None else (time.time() % 3600.0)
+            t = base_t + (i * 0.05) # 20fps-ish increment
 
             # ── Physics update ────────────────────────────────────────────────
             if cfg.ocean.enabled:
@@ -973,7 +1018,6 @@ class GLGeneratorWorker(QThread):
                         t_physics = t * o.time_multiplier
                         
                         # Calculate storm intensity correctly matching viewport
-                        # Synchronized storm intensity handling
                         storm = getattr(o, 'storm_intensity', 0.0)
                         if cfg.weather and cfg.weather.type == "stormy":
                             storm = max(storm, cfg.weather.intensity)
@@ -982,33 +1026,25 @@ class GLGeneratorWorker(QThread):
                         bob_intensity = getattr(obj, 'float_bob', 1.0)
                         h = ocean_physics.get_wave_height(
                             px, pz, t_physics,
-                            wind_speed=o.wind_speed,
-                            wind_direction=o.wind_direction,
-                            choppiness=o.choppiness,
-                            wave_amplitude=o.wave_amplitude,
+                            wind_speed=o.wind_speed, wind_direction=o.wind_direction,
+                            choppiness=o.choppiness, wave_amplitude=o.wave_amplitude,
                             repetition_size=o.repetition_size,
-                            band0_multiplier=o.band0_multiplier,
-                            band1_multiplier=o.band1_multiplier,
-                            chaos=o.chaos,
-                            storm_intensity=storm
+                            band0_multiplier=o.band0_multiplier, band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos, storm_intensity=storm
                         ) * bob_intensity
                         
-                        # Apply submergence offset (positive = deeper)
+                        # Apply submergence offset
                         submergence = getattr(obj, 'buoyancy_offset', 0.0)
                         obj.pos_y = o.level + h - submergence
 
-                        # Tiling
+                        # Surface normals (tilt)
                         n = ocean_physics.get_surface_normal(
                             px, pz, t_physics,
-                            wind_speed=o.wind_speed,
-                            wind_direction=o.wind_direction,
-                            choppiness=o.choppiness,
-                            wave_amplitude=o.wave_amplitude,
+                            wind_speed=o.wind_speed, wind_direction=o.wind_direction,
+                            choppiness=o.choppiness, wave_amplitude=o.wave_amplitude,
                             repetition_size=o.repetition_size,
-                            band0_multiplier=o.band0_multiplier,
-                            band1_multiplier=o.band1_multiplier,
-                            chaos=o.chaos,
-                            storm_intensity=storm
+                            band0_multiplier=o.band0_multiplier, band1_multiplier=o.band1_multiplier,
+                            chaos=o.chaos, storm_intensity=storm
                         )
                         import math
                         tilt_strength = getattr(obj, 'float_tilt', 1.0)
@@ -1023,6 +1059,9 @@ class GLGeneratorWorker(QThread):
                 env_strength=env_str,
                 hdri_rotation=hdri_rot
             )
+            
+            # Restore original objects
+            cfg.scene_objects = orig_objects
 
             # ── Save image ────────────────────────────────────────────────────
             name = f"{cfg.class_name.lower()}_{i:05d}"
@@ -1062,6 +1101,7 @@ class GLGeneratorWorker(QThread):
                 pct = (i + 1) / cfg.num_images * 100
                 self._log(f"[{pct:5.1f}%] {i+1}/{cfg.num_images}  "
                           f"cam=az{azim:.0f}/el{elev:.0f}/d{dist:.0f}  "
+                          f"target=[{self._target[0]:.1f},{self._target[1]:.1f},{self._target[2]:.1f}]  "
                           f"objs={len(bboxes)}")
                 self.stats_updated.emit({
                     "generated": i + 1,

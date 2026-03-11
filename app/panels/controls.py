@@ -86,7 +86,8 @@ class ControlsPanel(QWidget):
         self.cfg = cfg
         
         # Path to randomizers
-        self.base_path = os.path.join("d:\\Jaymei\\Skunkworks", "renderer", "randomizers")
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.base_path = os.path.join(root, "renderer", "randomizers")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 16, 12, 16)
@@ -149,7 +150,7 @@ class ControlsPanel(QWidget):
         self.refresh()
 
     def refresh(self):
-        """Scans the directory and rebuilds the list."""
+        """Scans the directory and rebuilds the list organized by category."""
         # Clear layout
         while self.list_layout.count() > 1:
             item = self.list_layout.takeAt(0)
@@ -162,11 +163,39 @@ class ControlsPanel(QWidget):
         scripts = [f for f in os.listdir(self.base_path) if f.endswith(".cs")]
         scripts.sort()
 
+        # Group by category (importing constants from widget file)
+        from .randomizer_widgets import GLOBAL_RANDOMIZERS, OBJECT_RANDOMIZERS
+        
+        global_scripts = []
+        object_scripts = []
+        other_scripts  = []
+        
         for s in scripts:
-            full_path = os.path.join(self.base_path, s)
-            entry = RandomizerEntryWidget(full_path)
-            entry.clicked.connect(self._open_in_vscode)
-            self.list_layout.insertWidget(self.list_layout.count() - 1, entry)
+            name = s.replace(".cs", "")
+            if name in GLOBAL_RANDOMIZERS:
+                global_scripts.append(s)
+            elif name in OBJECT_RANDOMIZERS:
+                object_scripts.append(s)
+            else:
+                other_scripts.append(s)
+
+        def _add_section(title, file_list):
+            if not file_list:
+                return
+            
+            lbl = QLabel(title.upper())
+            lbl.setStyleSheet("font-weight: 800; color: #8b949e; font-size: 10px; margin-top: 10px; margin-left: 2px; letter-spacing: 1px;")
+            self.list_layout.insertWidget(self.list_layout.count() - 1, lbl)
+            
+            for s in file_list:
+                full_path = os.path.join(self.base_path, s)
+                entry = RandomizerEntryWidget(full_path)
+                entry.clicked.connect(self._open_in_vscode)
+                self.list_layout.insertWidget(self.list_layout.count() - 1, entry)
+
+        _add_section("Global Randomizers", global_scripts)
+        _add_section("Object Randomizers", object_scripts)
+        _add_section("Other / Custom", other_scripts)
 
     def _open_in_vscode(self, path: str):
         """Launches VS Code for the given path."""

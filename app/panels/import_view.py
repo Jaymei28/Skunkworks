@@ -95,7 +95,7 @@ class ObjectEntryWidget(QFrame):
         
         # Build
         for idx, inst in enumerate(self.cfg.randomizers):
-            comp = RandomizerComponentWidget(inst)
+            comp = RandomizerComponentWidget(inst, mode="object")
             comp.removed.connect(lambda i=idx: self._on_remove_randomizer(i))
             comp.updated.connect(self.updated.emit)
             self.rand_list_layout.addWidget(comp)

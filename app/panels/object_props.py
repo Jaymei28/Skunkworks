@@ -14,9 +14,36 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 
-from app.engine.scene_state import SceneObject
+from app.engine.scene_state import SceneObject, RandomizerInstance
 from app.engine.label_registry import REGISTRY
 
+
+# ── Compact Control Widgets ──────────────────────────────────────────────────
+
+class CompactSlider(QWidget):
+    """A tiny labeled slider/spinbox hybrid for the properties panel."""
+    valueChanged = Signal(float)
+    def __init__(self, label, val, min_v, max_v, step=0.1, parent=None):
+        super().__init__(parent)
+        l = QHBoxLayout(self)
+        l.setContentsMargins(12, 2, 12, 2)
+        l.setSpacing(4)
+        
+        lbl = QLabel(label)
+        lbl.setStyleSheet("color: #8b949e; font-size: 9px;")
+        l.addWidget(lbl)
+        
+        self.sb = QDoubleSpinBox()
+        self.sb.setRange(min_v, max_v)
+        self.sb.setSingleStep(step)
+        self.sb.setValue(val)
+        self.sb.setFixedHeight(18)
+        self.sb.setStyleSheet("""
+            QDoubleSpinBox { background: #0d1117; color: #cdd6f4; border: 1px solid #252d3d; 
+                             border-radius: 2px; font-size: 9px; padding: 0 2px; }
+        """)
+        self.sb.valueChanged.connect(self.valueChanged.emit)
+        l.addWidget(self.sb)
 
 # ── Color swatch helper ───────────────────────────────────────────────────────
 
@@ -341,10 +368,24 @@ class ObjectPropertiesPanel(QWidget):
 
         self._t_max_spin = _spin_row("Trans Max (px):", 0.0, 50.0, 0.5)
         self._s_jit_spin = _spin_row("Scale Jitter (%):", 0.0, 1.0, 0.05)
-        
         layout.addSpacing(5)
         self._rot_min_spin = _spin_row("Rot Min (Deg):", -360.0, 360.0, 10.0)
         self._rot_max_spin = _spin_row("Rot Max (Deg):", -360.0, 360.0, 10.0)
+
+        layout.addSpacing(20)
+
+        layout.addSpacing(20)
+
+        # ── Available Library ────────────────────────────────
+        lib_lbl = QLabel("AVAILABLE LIBRARY")
+        lib_lbl.setStyleSheet("color: #8b949e; font-size: 10px; font-weight: 800; letter-spacing: 1px;")
+        layout.addWidget(lib_lbl)
+
+        self._lib_container = QWidget()
+        self._lib_layout = QVBoxLayout(self._lib_container)
+        self._lib_layout.setContentsMargins(0, 5, 0, 0)
+        self._lib_layout.setSpacing(4)
+        layout.addWidget(self._lib_container)
 
         layout.addStretch()
         return tab
@@ -435,6 +476,10 @@ class ObjectPropertiesPanel(QWidget):
         self._rand_scale_chk.blockSignals(False)
         self._t_max_spin.blockSignals(False)
         self._s_jit_spin.blockSignals(False)
+        self._rot_min_spin.blockSignals(False)
+        self._rot_max_spin.blockSignals(False)
+
+        self._refresh_library()
 
     def _set_enabled(self, v: bool):
         self._tabs.setEnabled(v)
@@ -520,3 +565,119 @@ class ObjectPropertiesPanel(QWidget):
             return
         # (future: iterate scene_objects and apply to matching mesh)
         pass
+
+    def _refresh_library(self):
+        """Rebuilds the per-object randomizer library UI."""
+        from .randomizer_widgets import OBJECT_RANDOMIZERS
+        
+        # Clear existing
+        while self._lib_layout.count():
+            item = self._lib_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if self._obj is None:
+            return
+
+        cfg = self._obj.config
+        active = {inst.type: inst for inst in cfg.randomizers}
+
+        # Define tweakables for object randomizers
+        OBJECT_RAND_CONFIGS = {
+            "TransformationRandomizer": [
+                ("Scale Min", "scale_min", 0.1, 5.0, 0.1),
+                ("Scale Max", "scale_max", 0.1, 5.0, 0.1),
+                ("Rot Range", "rot_range", 0, 360, 1.0),
+                ("Trans Range", "trans_range", 0, 100, 1.0)
+            ],
+            "DepthAwareTransformRandomizer": [
+                ("Dist Min", "dist_min", 1, 5000, 10.0),
+                ("Dist Max", "dist_max", 1, 5000, 10.0),
+                ("Frac Min", "frac_min", 0.01, 1.0, 0.01),
+                ("Frac Max", "frac_max", 0.01, 1.0, 0.01)
+            ],
+            "DepthScaleRandomizer": [
+                ("Frac Min", "frac_min", 0.01, 1.0, 0.01),
+                ("Frac Max", "frac_max", 0.01, 1.0, 0.01)
+            ],
+            "PoseRandomizer": [
+                ("Dist Min", "dist_min", 0, 5000, 10.0),
+                ("Dist Max", "dist_max", 0, 5000, 10.0),
+                ("Elev Min", "elev_min", -90, 90, 1.0),
+                ("Elev Max", "elev_max", -90, 90, 1.0)
+            ],
+            "TextureRandomizer": []
+        }
+
+        for rand_type in OBJECT_RANDOMIZERS:
+            inst = active.get(rand_type)
+            
+            wrapper = QFrame()
+            wrapper.setObjectName("rand_wrapper")
+            wrapper.setStyleSheet("""
+                QFrame#rand_wrapper { 
+                    background: #1c2333; border: 1px solid #252d3d; 
+                    border-radius: 4px; padding: 0px;
+                }
+            """)
+            wl = QVBoxLayout(wrapper)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setSpacing(0)
+
+            # Header row with checkbox
+            head = QHBoxLayout()
+            head.setContentsMargins(10, 6, 10, 6)
+            
+            chk = QCheckBox(rand_type)
+            chk.setStyleSheet("color: #cdd6f4; font-weight: 500; font-size: 11px;")
+            chk.blockSignals(True)
+            chk.setChecked(inst is not None and getattr(inst, 'enabled', True))
+            chk.blockSignals(False)
+            
+            chk.toggled.connect(lambda v, t=rand_type: self._on_toggle_obj_rand(t, v))
+            head.addWidget(chk)
+            head.addStretch()
+            wl.addLayout(head)
+
+            # If active, show settings
+            if inst and inst.enabled:
+                if rand_type in OBJECT_RAND_CONFIGS and OBJECT_RAND_CONFIGS[rand_type]:
+                    for label, key, min_v, max_v, step in OBJECT_RAND_CONFIGS[rand_type]:
+                        val = inst.params.get(key, (min_v + max_v) / 2.0)
+                        s = CompactSlider(label, val, min_v, max_v, step)
+                        s.setContentsMargins(15, 0, 0, 0)
+                        s.valueChanged.connect(lambda v, t=rand_type, k=key: self._sync_obj_rand_attr(t, k, v))
+                        wl.addWidget(s)
+                    wl.addSpacing(4)
+                else:
+                    if rand_type != "TextureRandomizer": # Hide hint for Simple ones
+                        hint = QLabel("  (No tweakables for this type)")
+                        hint.setStyleSheet("color: #555; font-style: italic; font-size: 9px; margin-bottom: 4px;")
+                        wl.addWidget(hint)
+
+            self._lib_layout.addWidget(wrapper)
+
+    def _on_toggle_obj_rand(self, rand_type, checked):
+        if self._obj is None: return
+        cfg = self._obj.config
+        
+        found = False
+        for i in cfg.randomizers:
+            if i.type == rand_type:
+                i.enabled = checked
+                found = True
+                break
+        
+        if not found and checked:
+            cfg.randomizers.append(RandomizerInstance(type=rand_type, enabled=True))
+        
+        self._refresh_library()
+        self.transform_changed.emit(self._obj)
+
+    def _sync_obj_rand_attr(self, rand_type, attr, val):
+        if self._obj is None: return
+        for i in self._obj.config.randomizers:
+            if i.type == rand_type:
+                i.params[attr] = val
+                break
+        self.transform_changed.emit(self._obj)
